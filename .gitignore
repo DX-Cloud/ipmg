@@ -1,0 +1,20 @@
+# 编译产物
+*.exe
+build/
+*.spec
+
+# 用户数据（配置已迁移到 %USERPROFILE%\ipmg\）
+config.yaml
+logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 规划文件
+.cospec/
+
+# IDE
+.vscode/
+.idea/

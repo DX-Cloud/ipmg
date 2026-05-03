@@ -1,0 +1,222 @@
+"""
+配置文件管理模块
+提供YAML配置文件的读写、容错、默认配置生成能力
+"""
+
+import os
+import sys
+import copy
+import shutil
+from datetime import datetime
+from typing import Any
+
+import yaml
+
+
+# 配置文件路径：统一存放在 %USERPROFILE%\ipmg\
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), "ipmg")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.yaml")
+
+# 设备配置默认字段及默认值
+DEVICE_DEFAULTS = {
+    "name": "",
+    "device_ip": "",
+    "ip_mode": "auto",       # auto | manual
+    "adapter_ip": "",
+    "subnet_mask": "255.255.255.0",
+    "gateway": "",
+    "management_url": "https://{device_ip}",
+    "favorite": False,
+}
+
+# 必填字段
+DEVICE_REQUIRED = ["name", "device_ip", "subnet_mask"]
+
+
+def _get_default_config() -> dict:
+    """获取默认配置结构"""
+    return {
+        "devices": [],
+        "network_adapters": {
+            "last_selected_mac": "",
+        },
+        "backups": {},
+    }
+
+
+def _normalize_device(device: dict) -> dict:
+    """规范化设备配置，补充缺失字段"""
+    normalized = copy.deepcopy(DEVICE_DEFAULTS)
+    for key, default_val in normalized.items():
+        if key in device:
+            normalized[key] = device[key]
+        else:
+            normalized[key] = default_val
+    return normalized
+
+
+def load_config(config_path: str = None) -> dict:
+    """
+    加载配置文件。
+    文件不存在或格式错误时自动创建默认配置。
+    """
+    path = config_path or CONFIG_FILE
+
+    if not os.path.exists(path):
+        config = _get_default_config()
+        save_config(config, path)
+        return config
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        if not isinstance(config, dict):
+            config = _get_default_config()
+
+        # 确保顶层结构完整
+        if "devices" not in config:
+            config["devices"] = []
+        if "network_adapters" not in config:
+            config["network_adapters"] = {"last_selected_mac": ""}
+        if "backups" not in config:
+            config["backups"] = {}
+
+        # 规范化每个设备配置
+        config["devices"] = [_normalize_device(d) for d in config["devices"]]
+
+        return config
+
+    except yaml.YAMLError:
+        # YAML解析失败，备份损坏文件并返回默认配置
+        backup_path = f"{path}.corrupted.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        try:
+            shutil.copy2(path, backup_path)
+        except Exception:
+            pass
+        config = _get_default_config()
+        save_config(config, path)
+        return config
+
+
+def save_config(config: dict, config_path: str = None) -> None:
+    """
+    将配置写回YAML文件。
+    写入失败时抛出异常由调用方处理。
+    """
+    path = config_path or CONFIG_FILE
+
+    # 确保目录存在
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+def get_devices(config: dict) -> list:
+    """
+    获取设备列表。
+    收藏设备优先排序。
+    """
+    devices = config.get("devices", [])
+    # 收藏设备排前面
+    return sorted(devices, key=lambda d: (not d.get("favorite", False), d.get("name", "")))
+
+
+def add_device(config: dict, device: dict) -> dict:
+    """添加设备到配置"""
+    normalized = _normalize_device(device)
+    config["devices"].append(normalized)
+    return config
+
+
+def update_device(config: dict, index: int, device: dict) -> dict:
+    """更新指定索引的设备配置"""
+    if 0 <= index < len(config["devices"]):
+        normalized = _normalize_device(device)
+        config["devices"][index] = normalized
+    return config
+
+
+def delete_device(config: dict, index: int) -> dict:
+    """删除指定索引的设备"""
+    if 0 <= index < len(config["devices"]):
+        config["devices"].pop(index)
+    return config
+
+
+def get_last_adapter_mac(config: dict) -> str:
+    """获取上次选择的网卡MAC"""
+    return config.get("network_adapters", {}).get("last_selected_mac", "")
+
+
+def set_last_adapter_mac(config: dict, mac: str) -> dict:
+    """设置上次选择的网卡MAC"""
+    if "network_adapters" not in config:
+        config["network_adapters"] = {}
+    config["network_adapters"]["last_selected_mac"] = mac
+    return config
+
+
+def get_adapter_backups(config: dict) -> dict:
+    """获取所有网卡备份"""
+    return config.get("backups", {})
+
+
+def get_adapter_backup(config: dict, mac: str) -> dict:
+    """获取指定MAC的网卡备份"""
+    return config.get("backups", {}).get(mac, None)
+
+
+def save_adapter_backup(config: dict, mac: str, backup: dict) -> dict:
+    """保存网卡备份"""
+    if "backups" not in config:
+        config["backups"] = {}
+    config["backups"][mac] = backup
+    return config
+
+
+def clear_adapter_backup(config: dict, mac: str) -> dict:
+    """清除指定MAC的网卡备份"""
+    config.get("backups", {}).pop(mac, None)
+    return config
+
+
+def export_config(config: dict, export_path: str) -> None:
+    """导出配置到指定路径"""
+    save_config(config, export_path)
+
+
+def import_config(import_path: str) -> dict:
+    """
+    从指定路径导入配置。
+    验证必要字段，缺失字段使用默认值填充。
+    """
+    return load_config(import_path)
+
+
+def validate_device(device: dict) -> list:
+    """
+    验证设备配置字段完整性。
+    返回错误信息列表，空列表表示验证通过。
+    """
+    errors = []
+    for field in DEVICE_REQUIRED:
+        if not device.get(field):
+            errors.append(f"缺少必填字段: {field}")
+
+    # 验证IP格式（简单检查）
+    if device.get("device_ip"):
+        parts = device["device_ip"].split(".")
+        if len(parts) != 4:
+            errors.append("设备IP格式无效")
+        else:
+            try:
+                [int(p) for p in parts]
+            except ValueError:
+                errors.append("设备IP格式无效")
+
+    if device.get("ip_mode") == "manual" and not device.get("adapter_ip"):
+        errors.append("手动指定模式下，网卡IP不能为空")
+
+    return errors
