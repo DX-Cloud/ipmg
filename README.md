@@ -2,6 +2,8 @@
 
 > 一个 Windows 命令行 TUI 工具，专为网络工程师设计，用于一键切换网卡的 IP 配置以对接不同管理网段的网络设备（交换机、路由器、防火墙、AP、AC 等）。
 
+> 本项目完全由Vibe Coding完成(Model:GLM-5.1 | IDE:VSCode | Agent:Costrict)。
+
 ## 目录
 
 - [背景](#背景)
