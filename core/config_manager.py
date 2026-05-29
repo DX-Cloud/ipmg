@@ -33,6 +33,10 @@ DEVICE_DEFAULTS = {
 DEVICE_REQUIRED = ["name", "device_ip", "subnet_mask"]
 
 
+# 历史记录最大数量
+MAX_HISTORY_RECORDS = 10
+
+
 def _get_default_config() -> dict:
     """获取默认配置结构"""
     return {
@@ -41,6 +45,7 @@ def _get_default_config() -> dict:
             "last_selected_mac": "",
         },
         "backups": {},
+        "ip_history": {},  # 按网卡MAC存储历史记录 {mac: [records...]}
     }
 
 
@@ -81,6 +86,8 @@ def load_config(config_path: str = None) -> dict:
             config["network_adapters"] = {"last_selected_mac": ""}
         if "backups" not in config:
             config["backups"] = {}
+        if "ip_history" not in config:
+            config["ip_history"] = {}
 
         # 规范化每个设备配置
         config["devices"] = [_normalize_device(d) for d in config["devices"]]
@@ -220,3 +227,83 @@ def validate_device(device: dict) -> list:
         errors.append("手动指定模式下，网卡IP不能为空")
 
     return errors
+
+
+# ============== IP历史记录管理函数 ==============
+
+def get_ip_history(config: dict, mac: str) -> list:
+    """
+    获取指定网卡的IP历史记录。
+    返回历史记录列表，按时间倒序排列（最新的在前）。
+    """
+    history = config.get("ip_history", {}).get(mac, [])
+    return history
+
+
+def _make_history_key(ip: str, mask: str, gateway: str) -> str:
+    """生成历史记录去重用的唯一键"""
+    return f"{ip}|{mask}|{gateway}"
+
+
+def add_ip_history(config: dict, mac: str, ip: str, mask: str, gateway: str, is_dhcp: bool = False) -> dict:
+    """
+    添加IP历史记录。
+    - 自动去重：相同IP配置合并为一项，更新时间戳
+    - 限制最多保存MAX_HISTORY_RECORDS条记录
+    - DHCP配置不记录到历史（因为有专门的DHCP选项）
+    """
+    if is_dhcp:
+        # DHCP配置不记录到历史
+        return config
+
+    if "ip_history" not in config:
+        config["ip_history"] = {}
+
+    history = config["ip_history"].get(mac, [])
+    new_record = {
+        "ip": ip,
+        "mask": mask,
+        "gateway": gateway or "",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+    # 去重：检查是否已存在相同配置
+    new_key = _make_history_key(ip, mask, gateway or "")
+    existing_index = None
+    for i, record in enumerate(history):
+        existing_key = _make_history_key(
+            record.get("ip", ""),
+            record.get("mask", ""),
+            record.get("gateway", "")
+        )
+        if existing_key == new_key:
+            existing_index = i
+            break
+
+    if existing_index is not None:
+        # 已存在，更新时间戳并移到最前面
+        history.pop(existing_index)
+        history.insert(0, new_record)
+    else:
+        # 不存在，添加到最前面
+        history.insert(0, new_record)
+
+    # 限制历史记录数量
+    if len(history) > MAX_HISTORY_RECORDS:
+        history = history[:MAX_HISTORY_RECORDS]
+
+    config["ip_history"][mac] = history
+    return config
+
+
+def clear_ip_history(config: dict, mac: str = None) -> dict:
+    """
+    清除IP历史记录。
+    - 如果指定MAC，清除该网卡的历史记录
+    - 如果不指定MAC，清除所有历史记录
+    """
+    if mac:
+        config.get("ip_history", {}).pop(mac, None)
+    else:
+        config["ip_history"] = {}
+    return config

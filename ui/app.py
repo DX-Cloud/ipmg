@@ -12,7 +12,8 @@ from rich.table import Table
 from core.adapter_manager import get_network_adapters, select_adapter
 from core.config_manager import (
     load_config, save_config, get_devices, set_last_adapter_mac,
-    get_last_adapter_mac, export_config, import_config, get_adapter_backup
+    get_last_adapter_mac, export_config, import_config, get_adapter_backup,
+    get_ip_history
 )
 from core.network_utils import resolve_adapter_ip, resolve_management_url, ping_host
 from core.ip_configurator import set_static_ip, set_dhcp, get_current_ip_config
@@ -78,6 +79,47 @@ def _pick_option(options: list, title: str, default_index: int = 0,
                 console.print(f"[red]无效输入，请输入 {hint}[/red]")
         except ValueError:
             console.print("[red]请输入数字[/red]")
+def _search_devices(devices: list, keyword: str) -> list:
+    """
+    搜索设备列表，支持名称和IP模糊匹配。
+    不区分大小写，部分匹配即可。
+    返回匹配的设备列表。
+    """
+    if not keyword:
+        return devices
+
+    keyword_lower = keyword.lower()
+    matched = []
+
+    for d in devices:
+        name = d.get("name", "").lower()
+        device_ip = d.get("device_ip", "").lower()
+
+        # 搜索设备名称或设备IP
+        if keyword_lower in name or keyword_lower in device_ip:
+            matched.append(d)
+
+    return matched
+
+
+def _build_device_options(devices: list) -> list:
+    """构建设备选项显示列表"""
+    device_options = []
+    for d in devices:
+        fav = "*" if d.get("favorite") else " "
+        try:
+            adapter_ip = resolve_adapter_ip(d)
+            ip_preview = f"-> 网卡IP: {adapter_ip}"
+        except Exception:
+            ip_preview = "-> 网卡IP: 计算失败"
+
+        mgmt_url = resolve_management_url(d)
+        url_status = " [Web]" if mgmt_url else ""
+
+        device_options.append(
+            f"[{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}"
+        )
+    return device_options
 
 
 def show_main_menu(config: dict = None) -> str:
@@ -142,31 +184,55 @@ def run_configure_flow(config: dict) -> dict:
             input("\n按回车键返回...")
             return config
 
-        # Step 4: 选择设备
-        device_options = []
-        for d in devices:
-            fav = "*" if d.get("favorite") else " "
-            try:
-                adapter_ip = resolve_adapter_ip(d)
-                ip_preview = f"-> 网卡IP: {adapter_ip}"
-            except Exception:
-                ip_preview = "-> 网卡IP: 计算失败"
+        # Step 4: 选择设备（支持搜索）
+        while True:
+            # 显示选择方式
+            mode_options = [
+                "显示全部设备",
+                "搜索设备（输入关键词）",
+            ]
+            mode_idx = _pick_option(
+                mode_options,
+                f"已选网卡: {selected_adapter.name} | 请选择设备"
+            )
+            if mode_idx < 0:
+                return config
 
-            mgmt_url = resolve_management_url(d)
-            url_status = " [Web]" if mgmt_url else ""
+            if mode_idx == 0:
+                # 显示全部设备
+                display_devices = devices
+            else:
+                # 搜索设备
+                console.print("\n[cyan]请输入搜索关键词（支持设备名称、IP模糊匹配）:[/cyan]")
+                keyword = input("关键词: ").strip()
+                if not keyword:
+                    console.print("[yellow][!] 关键词为空，显示全部设备[/yellow]")
+                    display_devices = devices
+                else:
+                    display_devices = _search_devices(devices, keyword)
+                    if not display_devices:
+                        console.print(f"[yellow][!] 无匹配结果（关键词: {keyword}）[/yellow]")
+                        retry = input("按 1 重新搜索，按其他键返回: ").strip()
+                        if retry == "1":
+                            continue
+                        else:
+                            return config
+                    else:
+                        console.print(f"[green]搜索结果: {len(display_devices)} 条匹配[/green]")
 
-            device_options.append(
-                f"[{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}"
+            # 构建并显示设备选项
+            device_options = _build_device_options(display_devices)
+            device_idx = _pick_option(
+                device_options,
+                f"已选网卡: {selected_adapter.name} | 选择设备"
             )
 
-        device_idx = _pick_option(
-            device_options,
-            f"已选网卡: {selected_adapter.name} | 请选择设备"
-        )
-        if device_idx < 0:
-            return config
+            if device_idx < 0:
+                # 返回上一页，重新选择搜索方式
+                continue
 
-        selected_device = devices[device_idx]
+            selected_device = display_devices[device_idx]
+            break
 
         # Step 5: 解析网卡IP
         try:
@@ -263,9 +329,8 @@ def run_configure_flow(config: dict) -> dict:
         input("\n按回车键返回...")
         return config
 
-
 def run_restore_flow(config: dict) -> dict:
-    """恢复网卡IP流程"""
+    """恢复网卡IP流程 - 支持历史记录选择"""
     try:
         show_header(config)
 
@@ -277,51 +342,106 @@ def run_restore_flow(config: dict) -> dict:
             input("\n按回车键返回...")
             return config
 
-        # 筛选有备份的网卡
-        backup_adapters = []
-        for a in adapters:
-            if has_backup(a.mac, config):
-                backup = get_adapter_backup(config, a.mac)
-                backup_adapters.append((a, backup))
+        # Step 1: 选择网卡
+        last_mac = get_last_adapter_mac(config)
+        default_idx = select_adapter(adapters, last_mac)
 
-        if not backup_adapters:
-            console.print("[yellow][!] 没有找到可恢复的网卡备份[/yellow]")
-            input("\n按回车键返回...")
+        adapter_options = []
+        for i, a in enumerate(adapters):
+            status = "已连接" if a.is_up else "未连接"
+            ip_str = f"IP: {a.display_ip}" if a.display_ip else "无IP"
+            mark = " <-- 上次" if i == default_idx else ""
+            adapter_options.append(
+                f"[{a.type_name}] {a.name} | {status} | {ip_str} | MAC: {a.mac}{mark}"
+            )
+
+        adapter_idx = _pick_option(
+            adapter_options, "请选择要恢复IP的网卡", default_index=default_idx
+        )
+        if adapter_idx < 0:
             return config
 
-        # 显示备份信息并选择
-        options = []
-        for a, backup in backup_adapters:
-            ip_info = f"备份IP: {backup.get('ip', 'DHCP')}"
-            mode_info = "DHCP" if backup.get("is_dhcp") else "静态IP"
-            options.append(f"{a.name} | {ip_info} | {mode_info} | MAC: {a.mac}")
+        selected_adapter = adapters[adapter_idx]
 
-        idx = _pick_option(options, "请选择要恢复的网卡")
+        # Step 2: 获取历史记录并显示选择界面
+        history = get_ip_history(config, selected_adapter.mac)
+
+        # 构建选项列表：第一项固定为DHCP，后面是历史记录
+        options = ["恢复为 DHCP（自动获取）"]
+
+        if history:
+            for record in history:
+                ip = record.get("ip", "")
+                mask = record.get("mask", "")
+                gateway = record.get("gateway", "")
+                timestamp = record.get("timestamp", "")
+                gw_str = f"  网关: {gateway}" if gateway else "  网关: 无"
+                options.append(f"{ip} / {mask}  {gw_str}  [{timestamp}]")
+        else:
+            # 没有历史记录时显示提示
+            console.print("\n[yellow][!] 该网卡暂无历史记录，仅可选择恢复为DHCP[/yellow]")
+
+        # 显示选择界面
+        console.print(f"\n[bold cyan]已选网卡: {selected_adapter.name}[/bold cyan]")
+        idx = _pick_option(options, "请选择要恢复的IP配置")
+
         if idx < 0:
             return config
 
-        selected_adapter, backup = backup_adapters[idx]
+        # Step 3: 执行恢复
+        if idx == 0:
+            # 选择DHCP
+            console.print(f"\n将恢复网卡 [cyan]{selected_adapter.name}[/cyan] 为 DHCP 自动获取")
+            confirm = input("\n确认恢复？(Y/n): ").strip().lower()
+            if confirm == "n":
+                return config
 
-        # 确认恢复
-        console.print(f"\n将恢复网卡 [cyan]{selected_adapter.name}[/cyan] 的IP配置:")
-        if backup.get("is_dhcp"):
-            console.print("  -> 恢复为 DHCP 自动获取")
+            try:
+                success = set_dhcp(selected_adapter.name)
+                if success:
+                    console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
+                    log_operation("恢复IP", selected_adapter.name, result="成功 -> DHCP")
+                else:
+                    console.print("[red][X] 恢复DHCP失败[/red]")
+                    log_operation("恢复IP", selected_adapter.name, result="失败: DHCP恢复失败")
+            except RuntimeError as e:
+                console.print(f"[red][X] {e}[/red]")
+                log_operation("恢复IP", selected_adapter.name, result=f"失败: {e}")
         else:
-            console.print(f"  -> 恢复为静态IP: {backup.get('ip', '')} / {backup.get('mask', '')}")
+            # 选择历史记录
+            record = history[idx - 1]  # 减1因为第一项是DHCP
+            ip = record.get("ip", "")
+            mask = record.get("mask", "255.255.255.0")
+            gateway = record.get("gateway", "")
 
-        confirm = input("\n确认恢复？(Y/n): ").strip().lower()
-        if confirm == "n":
-            return config
+            console.print(f"\n将恢复网卡 [cyan]{selected_adapter.name}[/cyan] 的IP配置:")
+            console.print(f"  -> IP: {ip} / {mask}")
+            if gateway:
+                console.print(f"  -> 网关: {gateway}")
 
-        # 执行恢复
-        success, error_msg = restore_adapter_config(selected_adapter.name, selected_adapter.mac, config)
-        if success:
-            console.print("[green][OK] 网卡IP恢复成功[/green]")
-            log_operation("恢复IP", selected_adapter.name, result="成功")
-        else:
-            console.print(f"[red][X] 网卡IP恢复失败: {error_msg}[/red]")
-            log_operation("恢复IP", selected_adapter.name, result=f"失败: {error_msg}")
+            confirm = input("\n确认恢复？(Y/n): ").strip().lower()
+            if confirm == "n":
+                return config
 
+            try:
+                success = set_static_ip(
+                    selected_adapter.name,
+                    ip,
+                    mask,
+                    gateway if gateway else None
+                )
+                if success:
+                    console.print(f"[green][OK] 已恢复为静态IP: {ip}[/green]")
+                    log_operation("恢复IP", selected_adapter.name, result=f"成功 -> {ip}")
+                else:
+                    console.print("[red][X] 恢复静态IP失败[/red]")
+                    log_operation("恢复IP", selected_adapter.name, result="失败: 静态IP设置失败")
+            except RuntimeError as e:
+                console.print(f"[red][X] {e}[/red]")
+                log_operation("恢复IP", selected_adapter.name, result=f"失败: {e}")
+
+        # 保存配置
+        save_config(config)
         input("\n按回车键返回...")
         return config
 
@@ -329,6 +449,7 @@ def run_restore_flow(config: dict) -> dict:
         log_error("恢复IP流程", str(e))
         console.print(f"[red][X] 发生错误: {e}[/red]")
         input("\n按回车键返回...")
+        return config
         return config
 
 

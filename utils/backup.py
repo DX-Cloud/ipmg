@@ -6,7 +6,7 @@
 from typing import Optional, Dict, Any
 
 from core.config_manager import (
-    get_adapter_backup, save_adapter_backup, clear_adapter_backup
+    get_adapter_backup, save_adapter_backup, clear_adapter_backup, add_ip_history
 )
 from core.ip_configurator import get_current_ip_config, set_static_ip, set_dhcp
 
@@ -15,6 +15,7 @@ def backup_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> 
     """
     备份指定网卡的当前IP配置。
     将IP、掩码、网关、是否DHCP等信息保存到配置文件。
+    同时将静态IP配置添加到历史记录（用于历史恢复功能）。
     成功返回 True，失败返回 False。
     """
     try:
@@ -31,6 +32,18 @@ def backup_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> 
         }
 
         save_adapter_backup(config, adapter_mac, backup)
+
+        # 添加到历史记录（仅静态IP）
+        if not current_config.get("is_dhcp", True):
+            add_ip_history(
+                config,
+                adapter_mac,
+                current_config.get("ip", ""),
+                current_config.get("mask", "255.255.255.0"),
+                current_config.get("gateway", ""),
+                is_dhcp=False
+            )
+
         return True
 
     except Exception:
