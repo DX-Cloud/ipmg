@@ -132,7 +132,7 @@ def show_device_manager(config: dict) -> dict:
         options = []
         index_map = {}
         opt_idx = 0
-        raw_devices = config.get("devices", [])  # 原始顺序
+        raw_devices = config.get("devices", [])
 
         if by_group:
             for g in groups:
@@ -140,9 +140,11 @@ def show_device_manager(config: dict) -> dict:
                 for d in devices:
                     fav = "*" if d.get("favorite") else " "
                     ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
-                    options.append(
-                        f"  [{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
-                    )
+                    group_tag = d.get("group", "")
+                    display = f"  [{fav}] {d['name']} | {d['device_ip']} | {ip_mode}"
+                    if group_tag:
+                        display += f" | [{group_tag}]"
+                    options.append(display)
                     # 用原始 config["devices"] 索引，不是排序后的索引
                     for ri, rd in enumerate(raw_devices):
                         if rd is d:
