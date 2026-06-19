@@ -123,6 +123,74 @@ def _build_device_options(devices: list) -> list:
     return device_options
 
 
+def _pick_grouped_device(config: dict, title: str) -> tuple:
+    """
+    按分组显示设备列表供用户选择。
+    返回 (selected_device, selected_device_index_in_config)，返回 None 表示取消。
+    """
+    from core.config_manager import get_devices_by_group, get_device_groups
+    by_group = get_devices_by_group(config)
+    groups = get_device_groups(config)
+    all_devices = get_devices(config)
+
+    if not all_devices:
+        return (None, -1)
+
+    # 先打印分组标题，再只把设备项交给 _pick_option
+    console.print(f"\n[bold cyan]{title}[/bold cyan]")
+    console.print("-" * 55)
+
+    pick_options = []
+    index_map = {}
+    pick_idx = 0
+
+    for g in groups:
+        label = f"── [{g}] ──" if g else "── [未分组] ──"
+        console.print(f"  [bold]{label}[/bold]")
+        devices = by_group.get(g, [])
+        for d in devices:
+            fav = "*" if d.get("favorite") else " "
+            try:
+                adapter_ip = resolve_adapter_ip(d)
+                ip_preview = f"-> 网卡IP: {adapter_ip}"
+            except Exception:
+                ip_preview = "-> 网卡IP: 计算失败"
+            mgmt_url = resolve_management_url(d)
+            url_status = " [Web]" if mgmt_url else ""
+            pick_options.append(f"  [{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}")
+            for gi, gd in enumerate(all_devices):
+                if gd is d:
+                    index_map[pick_idx] = gi
+                    break
+            pick_idx += 1
+
+    console.print("-" * 55)
+    console.print("  0. <-- 返回上一页")
+    console.print("-" * 55)
+
+    # 让用户选择
+    while True:
+        try:
+            prompt = f"请输入序号 (1-{len(pick_options)}, 0=返回): "
+            choice = input(prompt).strip()
+        except (KeyboardInterrupt, EOFError):
+            return (None, -1)
+
+        if not choice:
+            continue
+        if choice == "0":
+            return (None, -1)
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(pick_options):
+                if idx in index_map:
+                    return (all_devices[index_map[idx]], index_map[idx])
+                return (None, -1)
+            console.print(f"[red]无效输入，请输入 1-{len(pick_options)} 或 0 返回[/red]")
+        except ValueError:
+            console.print("[red]请输入数字[/red]")
+
+
 def show_main_menu(config: dict = None) -> str:
     """显示主菜单，返回用户选择"""
     show_header(config)
@@ -199,11 +267,10 @@ def run_configure_flow(config: dict) -> dict:
             input("\n按回车键返回...")
             return config
 
-        # Step 4: 选择设备（支持搜索）
+        # Step 4: 选择设备（支持搜索，全部设备按分组展示）
         while True:
-            # 显示选择方式
             mode_options = [
-                "显示全部设备",
+                "显示全部设备（按分组）",
                 "搜索设备（输入关键词）",
             ]
             mode_idx = _pick_option(
@@ -214,8 +281,13 @@ def run_configure_flow(config: dict) -> dict:
                 return config
 
             if mode_idx == 0:
-                # 显示全部设备
-                display_devices = devices
+                selected_device, _ = _pick_grouped_device(
+                    config,
+                    f"已选网卡: {selected_adapter.name} | 选择设备"
+                )
+                if selected_device is None:
+                    return config
+                break
             else:
                 # 搜索设备
                 console.print("\n[cyan]请输入搜索关键词（支持设备名称、IP模糊匹配）:[/cyan]")
@@ -235,18 +307,16 @@ def run_configure_flow(config: dict) -> dict:
                     else:
                         console.print(f"[green]搜索结果: {len(display_devices)} 条匹配[/green]")
 
-            # 构建并显示设备选项
-            device_options = _build_device_options(display_devices)
-            device_idx = _pick_option(
-                device_options,
-                f"已选网卡: {selected_adapter.name} | 选择设备"
-            )
-
-            if device_idx < 0:
-                continue
-
-            selected_device = display_devices[device_idx]
-            break
+                # 搜索结果是扁平列表
+                device_options = _build_device_options(display_devices)
+                device_idx = _pick_option(
+                    device_options,
+                    f"已选网卡: {selected_adapter.name} | 选择设备"
+                )
+                if device_idx < 0:
+                    continue
+                selected_device = display_devices[device_idx]
+                break
 
         # Step 5: 解析网卡IP
         try:
