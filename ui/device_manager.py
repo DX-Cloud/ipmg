@@ -145,6 +145,7 @@ def show_device_manager(config: dict) -> dict:
             console.print("[yellow]当前没有设备配置[/yellow]")
 
         idx = _pick_option(options, "设备管理 - 请选择设备或操作",
+                           page_size=8,
                            fixed_tail=["[+] 添加新设备"])
         if idx < 0:
             return config
@@ -175,6 +176,7 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
     options = [
         "[E] 编辑设备",
         "[D] 删除设备",
+        "[G] 设置分组",
         f"{'[*] 取消收藏' if device.get('favorite') else '[*] 设为收藏'}",
     ]
 
@@ -186,7 +188,6 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
         return config
 
     if idx == 0:
-        # 编辑
         result = _edit_device_ui(config, device_idx)
         if result:
             config = result
@@ -195,7 +196,6 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
             input("\n按回车键继续...")
 
     elif idx == 1:
-        # 删除
         confirm = input(f"确认删除设备 '{device['name']}'？(y/N): ").strip().lower()
         if confirm == "y":
             delete_device(config, device_idx)
@@ -204,7 +204,9 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
             input("\n按回车键继续...")
 
     elif idx == 2:
-        # 收藏
+        config = _set_device_group_ui(config, device_idx)
+
+    elif idx == 3:
         device["favorite"] = not device.get("favorite", False)
         update_device(config, device_idx, device)
         save_config(config)
@@ -213,6 +215,75 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
         input("\n按回车键继续...")
 
     return config
+
+
+def _set_device_group_ui(config: dict, device_idx: int) -> dict:
+    """设置设备分组（选择已有分组或新建分组）"""
+    devices = get_devices(config)
+    if device_idx >= len(devices):
+        return config
+
+    device = devices[device_idx]
+    current_group = device.get("group", "") or "未分组"
+
+    while True:
+        show_header(config)
+        console.print(f"\n[bold cyan]设备: {device['name']} | 当前分组: {current_group}[/bold cyan]")
+
+        mode_options = [
+            "选择已有分组",
+            "新建分组",
+        ]
+        mode_idx = _pick_option(mode_options, "请选择操作")
+        if mode_idx < 0:
+            return config
+
+        if mode_idx == 0:
+            # 选择已有分组
+            groups = get_device_groups(config)
+            group_options = []
+            group_map = {}
+            for i, g in enumerate(groups):
+                label = g if g else "未分组"
+                group_options.append(label)
+                group_map[i] = g
+
+            if not group_options:
+                console.print("[yellow][!] 暂无分组，请先新建[/yellow]")
+                input("\n按回车键继续...")
+                continue
+
+            g_idx = _pick_option(group_options, "请选择分组", page_size=8)
+            if g_idx < 0:
+                continue
+
+            selected_group = group_map.get(g_idx, "")
+            device["group"] = selected_group
+            update_device(config, device_idx, device)
+            save_config(config)
+            old_label = current_group
+            new_label = selected_group if selected_group else "未分组"
+            console.print(f"[green][OK] 分组已更改: {old_label} -> {new_label}[/green]")
+            input("\n按回车键返回...")
+            return config
+
+        else:
+            # 新建分组
+            new_group = input("请输入新分组名称: ").strip()
+            if not new_group:
+                console.print("[red]分组名称不能为空[/red]")
+                continue
+
+            confirm = input(f"确认将设备 '{device['name']}' 加入分组 '{new_group}'？(Y/n): ").strip().lower()
+            if confirm == "n":
+                continue
+
+            device["group"] = new_group
+            update_device(config, device_idx, device)
+            save_config(config)
+            console.print(f"[green][OK] 设备已加入分组: {new_group}[/green]")
+            input("\n按回车键返回...")
+            return config
 
 
 def _add_device_ui(config: dict) -> dict:
