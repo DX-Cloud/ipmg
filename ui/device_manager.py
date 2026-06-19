@@ -20,55 +20,85 @@ console = Console()
 
 
 def _pick_option(options: list, title: str, default_index: int = 0,
-                 allow_back: bool = True) -> int:
+                 allow_back: bool = True, page_size: int = 10) -> int:
     """
-    自定义数字选择菜单。
-    显示选项列表，用户输入数字选择，返回选择索引。
-    自动在末尾添加 "0. 返回" 选项。
+    自定义数字选择菜单，支持自动分页。
+    当选项超过 page_size 条时自动分页，底部显示翻页导航。
     返回 -1 表示用户选择返回。
     """
-    all_options = list(options)
-    if allow_back:
-        all_options.append("<-- 返回上一页")
+    if not options:
+        return -1
+
+    total = len(options)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    current_page = 0
 
     while True:
+        start = current_page * page_size
+        end = min(start + page_size, total)
+        page_items = options[start:end]
+
         console.print(f"\n[bold cyan]{title}[/bold cyan]")
         console.print("-" * 55)
-        for i, opt in enumerate(all_options):
-            num = i + 1
-            if allow_back and i == len(all_options) - 1:
-                # 返回选项用 0 作为快捷键
-                console.print(f"   0. {opt}")
-            else:
-                marker = " > " if i == default_index else "   "
-                console.print(f"{marker}{num}. {opt}")
+        for i, opt in enumerate(page_items):
+            num = start + i + 1
+            marker = " > " if (start + i) == default_index else "   "
+            console.print(f"{marker}{num}. {opt}")
+
+        # 分页导航
+        if total_pages > 1:
+            bottom_options = []
+            if current_page > 0:
+                bottom_options.append("↑ 上一页")
+            if current_page < total_pages - 1:
+                bottom_options.append("↓ 下一页")
+            nav_prompt = f" (第{current_page + 1}/{total_pages}页)"
+            console.print(f"  [dim]{' | '.join(bottom_options)}{nav_prompt}[/dim]")
+
+        if allow_back:
+            console.print(f"   0. <-- 返回上一页")
         console.print("-" * 55)
 
         try:
-            prompt = f"请输入序号 (默认 {default_index + 1}"
+            prompt = f"请输入序号 (1-{total}"
             if allow_back:
                 prompt += ", 0=返回"
+            if total_pages > 1:
+                prompt += ", n=下一页 p=上一页"
             prompt += "): "
             choice = input(prompt).strip()
         except (KeyboardInterrupt, EOFError):
             return -1
 
         if not choice:
-            return default_index
+            if default_index < total:
+                return default_index
+            continue
 
-        # 处理返回
         if allow_back and choice == "0":
             return -1
 
+        # 翻页
+        if total_pages > 1:
+            if choice.lower() in ("n", "next", ">", "."):
+                if current_page < total_pages - 1:
+                    current_page += 1
+                continue
+            if choice.lower() in ("p", "prev", "<", ","):
+                if current_page > 0:
+                    current_page -= 1
+                continue
+
         try:
             idx = int(choice) - 1
-            if 0 <= idx < len(options):
+            if 0 <= idx < total:
                 return idx
             else:
-                max_num = len(options)
-                hint = f"1-{max_num}"
+                hint = f"1-{total}"
                 if allow_back:
                     hint += " 或 0 返回"
+                if total_pages > 1:
+                    hint += ", n/p 翻页"
                 console.print(f"[red]无效输入，请输入 {hint}[/red]")
         except ValueError:
             console.print("[red]请输入数字[/red]")
