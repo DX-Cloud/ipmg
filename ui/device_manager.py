@@ -32,7 +32,6 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
     fixed_tail = fixed_tail or []
     total = len(options)
-    total_with_fixed = total + len(fixed_tail)
     total_pages = max(1, (total + page_size - 1) // page_size)
     current_page = 0
 
@@ -40,6 +39,7 @@ def _pick_option(options: list, title: str, default_index: int = 0,
         start = current_page * page_size
         end = min(start + page_size, total)
         page_items = options[start:end]
+        fixed_base = min(start + page_size, total)
 
         console.print(f"\n[bold cyan]{title}[/bold cyan]")
         console.print("-" * 55)
@@ -121,16 +121,21 @@ def show_device_manager(config: dict) -> dict:
         by_group = get_devices_by_group(config)
         groups = get_device_groups(config)
 
-        # 构建分组显示的选项列表 + 索引映射
+        # 先打印分组标题
+        if by_group:
+            for g in groups:
+                label = f"── [{g}] ──" if g else "── [未分组] ──"
+                console.print(f"  [bold]{label}[/bold]")
+        else:
+            console.print("[yellow]当前没有设备配置[/yellow]")
+
+        # 只将设备项交给 _pick_option（分组标题单独打印）
         options = []
-        index_map = {}  # options索引 -> config设备列表索引
+        index_map = {}
         opt_idx = 0
 
         if by_group:
             for g in groups:
-                label = f"── [分组: {g}] ──" if g else "── [未分组] ──"
-                options.append(label)
-                opt_idx += 1
                 devices = by_group.get(g, [])
                 for d in devices:
                     fav = "*" if d.get("favorite") else " "
@@ -138,14 +143,11 @@ def show_device_manager(config: dict) -> dict:
                     options.append(
                         f"  [{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
                     )
-                    # 找到该设备在全局设备列表中的索引
                     for gi, gd in enumerate(all_devices):
                         if gd is d:
                             index_map[opt_idx] = gi
                             break
                     opt_idx += 1
-        else:
-            console.print("[yellow]当前没有设备配置[/yellow]")
 
         idx = _pick_option(options, "设备管理 - 请选择设备或操作",
                            page_size=8,
@@ -153,7 +155,7 @@ def show_device_manager(config: dict) -> dict:
         if idx < 0:
             return config
 
-        if idx == len(options):
+        if idx >= len(options):
             result = _add_device_ui(config)
             if result:
                 config = result
