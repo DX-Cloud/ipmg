@@ -13,12 +13,13 @@ from core.adapter_manager import get_network_adapters, select_adapter
 from core.config_manager import (
     load_config, save_config, get_devices, set_last_adapter_mac,
     get_last_adapter_mac, export_config, import_config, get_adapter_backup,
-    get_ip_history
+    get_ip_history, backup_stack_depth, pop_adapter_backup
 )
 from core.network_utils import resolve_adapter_ip, resolve_management_url, ping_host
 from core.ip_configurator import set_static_ip, set_dhcp, get_current_ip_config
 from core.browser_launcher import open_management_page, open_url
 from utils.backup import backup_adapter_config, restore_adapter_config, has_backup
+from utils.backup import undo_adapter_config, undo_stack_depth
 from utils.logger import log_operation, log_error
 from ui.device_manager import show_device_manager
 from ui.header import show_header
@@ -103,7 +104,7 @@ def _search_devices(devices: list, keyword: str) -> list:
 
 
 def _build_device_options(devices: list) -> list:
-    """构建设备选项显示列表"""
+    """构建设备选项显示列表（扁平列表，无分组）"""
     device_options = []
     for d in devices:
         fav = "*" if d.get("favorite") else " "
@@ -126,9 +127,23 @@ def show_main_menu(config: dict = None) -> str:
     """显示主菜单，返回用户选择"""
     show_header(config)
 
+    # 检查各网卡是否有可撤销的备份
+    undo_depth = 0
+    if config:
+        try:
+            from core.adapter_manager import get_network_adapters
+            adapters = get_network_adapters()
+            for a in adapters:
+                d = undo_stack_depth(a.mac, config)
+                if d > undo_depth:
+                    undo_depth = d
+        except Exception:
+            pass
+
     options = [
         "配置IP - 选择网卡和设备，一键配置",
         "恢复IP - 恢复网卡原始IP配置",
+        f"撤销IP - 撤销最近一次IP配置{' [' + str(undo_depth) + '级可撤销]' if undo_depth > 0 else ''}",
         "管理设备 - 添加/编辑/删除设备",
         "导出配置",
         "导入配置",
@@ -136,7 +151,7 @@ def show_main_menu(config: dict = None) -> str:
     ]
 
     idx = _pick_option(options, "请选择操作", allow_back=False)
-    actions = ["configure", "restore", "manage", "export", "import", "exit"]
+    actions = ["configure", "restore", "undo", "manage", "export", "import", "exit"]
     if idx < 0:
         return "exit"
     return actions[idx]
@@ -228,7 +243,6 @@ def run_configure_flow(config: dict) -> dict:
             )
 
             if device_idx < 0:
-                # 返回上一页，重新选择搜索方式
                 continue
 
             selected_device = display_devices[device_idx]
@@ -450,6 +464,145 @@ def run_restore_flow(config: dict) -> dict:
         console.print(f"[red][X] 发生错误: {e}[/red]")
         input("\n按回车键返回...")
         return config
+        return config
+
+
+def run_undo_flow(config: dict) -> dict:
+    """撤销IP配置流程 - 支持多级撤销"""
+    try:
+        show_header(config)
+
+        console.print("\n[bold cyan]正在获取网卡列表...[/bold cyan]")
+        adapters = get_network_adapters()
+
+        if not adapters:
+            console.print("[red][X] 未检测到网卡[/red]")
+            input("\n按回车键返回...")
+            return config
+
+        # 选择网卡
+        last_mac = get_last_adapter_mac(config)
+        default_idx = select_adapter(adapters, last_mac)
+
+        adapter_options = []
+        for i, a in enumerate(adapters):
+            status = "已连接" if a.is_up else "未连接"
+            ip_str = f"IP: {a.display_ip}" if a.display_ip else "无IP"
+            depth = undo_stack_depth(a.mac, config)
+            depth_str = f" [可撤销: {depth}级]" if depth > 0 else " [无备份]"
+            mark = " <-- 上次" if i == default_idx else ""
+            adapter_options.append(
+                f"[{a.type_name}] {a.name} | {status} | {ip_str} | MAC: {a.mac}{mark}{depth_str}"
+            )
+
+        adapter_idx = _pick_option(
+            adapter_options, "请选择要撤销的网卡", default_index=default_idx
+        )
+        if adapter_idx < 0:
+            return config
+
+        selected_adapter = adapters[adapter_idx]
+
+        # 检查可撤销深度
+        depth = undo_stack_depth(selected_adapter.mac, config)
+        if depth == 0:
+            console.print("[yellow][!] 该网卡无可撤销的备份记录[/yellow]")
+            input("\n按回车键返回...")
+            return config
+
+        # 显示备份栈
+        from core.config_manager import get_adapter_backup_stack
+        stack = get_adapter_backup_stack(config, selected_adapter.mac)
+        console.print(f"\n[bold cyan]网卡: {selected_adapter.name} | 可撤销 {len(stack)} 级[/bold cyan]")
+
+        stack_options = []
+        for i, bk in enumerate(stack):
+            ip = bk.get("ip", "")
+            mask = bk.get("mask", "")
+            gw = bk.get("gateway", "")
+            ts = bk.get("timestamp", "")
+            mode = "DHCP" if bk.get("is_dhcp") else "静态"
+            gw_str = f"  网关: {gw}" if gw else ""
+            stack_options.append(f"[{mode}] {ip}/{mask}{gw_str}  [{ts}]")
+
+        idx = _pick_option(stack_options, "选择要撤销到哪个版本（撤销后将恢复该版本）")
+
+        if idx < 0:
+            return config
+
+        # 确认
+        selected_bk = stack[idx]
+        mode_label = "DHCP" if selected_bk.get("is_dhcp") else f"静态IP: {selected_bk.get('ip', '')}"
+        console.print(f"\n[bold]--- 撤销确认 ---[/bold]")
+        console.print(f"  网卡:     {selected_adapter.name}")
+        console.print(f"  恢复到:   {mode_label}")
+        if not selected_bk.get("is_dhcp"):
+            console.print(f"  IP/掩码:  {selected_bk.get('ip', '')} / {selected_bk.get('mask', '255.255.255.0')}")
+            if selected_bk.get("gateway"):
+                console.print(f"  网关:     {selected_bk.get('gateway', '')}")
+
+        confirm = input("\n确认执行撤销？(Y/n): ").strip().lower()
+        if confirm == "n":
+            console.print("[yellow]已取消[/yellow]")
+            input("\n按回车键返回...")
+            return config
+
+        # 弹出直到目标位置的备份并应用
+        success_count = 0
+        while True:
+            bk, config = pop_adapter_backup(config, selected_adapter.mac)
+            if bk is None:
+                break
+            success_count += 1
+            # 如果是DHCP备份，或者这是目标版本，执行恢复
+            is_target = (bk is selected_bk) or (success_count == 1 and idx == 0)
+
+            if is_target:
+                console.print(f"[bold cyan]正在撤销到目标版本...[/bold cyan]")
+                try:
+                    if bk.get("is_dhcp", True):
+                        result = set_dhcp(selected_adapter.name)
+                        if not result:
+                            console.print("[red][X] 撤销DHCP失败[/red]")
+                            input("\n按回车键返回...")
+                            return config
+                        console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
+                    else:
+                        result = set_static_ip(
+                            selected_adapter.name,
+                            bk.get("ip", ""),
+                            bk.get("mask", "255.255.255.0"),
+                            bk.get("gateway", "") or None,
+                        )
+                        if not result:
+                            console.print("[red][X] 撤销静态IP失败[/red]")
+                            input("\n按回车键返回...")
+                            return config
+                        console.print(f"[green][OK] 已恢复为静态IP: {bk.get('ip', '')}[/green]")
+
+                    log_operation("撤销IP", selected_adapter.name, result=f"撤销到 {bk.get('ip', 'DHCP')}")
+                    console.print(f"[green][OK] 撤销成功，共跳过 {success_count - 1} 级中间版本[/green]")
+                except RuntimeError as e:
+                    console.print(f"[red][X] 撤销失败: {e}[/red]")
+                    log_operation("撤销IP", selected_adapter.name, result=f"失败: {e}")
+                    input("\n按回车键返回...")
+                    return config
+                break
+
+            # 非目标版本，继续弹出
+            console.print(f"  [dim]跳过中间版本: {bk.get('ip', 'DHCP')} [{bk.get('timestamp', '')}][/dim]")
+
+        # 保存更新后的配置
+        save_config(config)
+        input("\n按回车键返回...")
+        return config
+
+    except Exception as e:
+        log_error("撤销IP流程", str(e))
+        console.print(f"[red][X] 发生错误: {e}[/red]")
+        import traceback
+        traceback.print_exc()
+        input("\n按回车键返回...")
         return config
 
 

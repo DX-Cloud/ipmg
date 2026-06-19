@@ -48,7 +48,7 @@ def main():
     # 导入模块（延迟导入，加快启动感知速度）
     from core.config_manager import load_config, save_config
     from ui.app import show_main_menu, run_configure_flow, run_restore_flow
-    from ui.app import run_export_import_flow
+    from ui.app import run_export_import_flow, run_undo_flow
     from ui.device_manager import show_device_manager
     from utils.logger import log_info
 
@@ -66,6 +66,9 @@ def main():
                 config = run_configure_flow(config)
             elif action == "restore":
                 config = run_restore_flow(config)
+            elif action == "undo":
+                config = run_undo_flow(config)
+                save_config(config)
             elif action == "manage":
                 config = show_device_manager(config)
                 save_config(config)

@@ -9,7 +9,7 @@ from rich.table import Table
 
 from core.config_manager import (
     get_devices, add_device, update_device, delete_device,
-    save_config, validate_device
+    save_config, validate_device, get_device_groups, get_devices_by_group
 )
 from core.network_utils import (
     calculate_adapter_ip_auto, validate_ip, validate_subnet_mask
@@ -75,20 +75,37 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
 
 def show_device_manager(config: dict) -> dict:
-    """设备管理主菜单"""
+    """设备管理主菜单 - 按分组展示"""
     while True:
         show_header(config)
 
-        devices = get_devices(config)
-        options = []
+        all_devices = get_devices(config)
+        by_group = get_devices_by_group(config)
+        groups = get_device_groups(config)
 
-        if devices:
-            for i, d in enumerate(devices):
-                fav = "*" if d.get("favorite") else " "
-                ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
-                options.append(
-                    f"[{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
-                )
+        # 构建分组显示的选项列表 + 索引映射
+        options = []
+        index_map = {}  # options索引 -> config设备列表索引
+        opt_idx = 0
+
+        if by_group:
+            for g in groups:
+                label = f"── [分组: {g}] ──" if g else "── [未分组] ──"
+                options.append(label)
+                opt_idx += 1
+                devices = by_group.get(g, [])
+                for d in devices:
+                    fav = "*" if d.get("favorite") else " "
+                    ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
+                    options.append(
+                        f"  [{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
+                    )
+                    # 找到该设备在全局设备列表中的索引
+                    for gi, gd in enumerate(all_devices):
+                        if gd is d:
+                            index_map[opt_idx] = gi
+                            break
+                    opt_idx += 1
         else:
             console.print("[yellow]当前没有设备配置[/yellow]")
 
@@ -99,16 +116,14 @@ def show_device_manager(config: dict) -> dict:
             return config
 
         if idx == len(options) - 1:
-            # 添加新设备
             result = _add_device_ui(config)
             if result:
                 config = result
                 save_config(config)
                 console.print("[green][OK] 设备添加成功[/green]")
                 input("\n按回车键继续...")
-        elif devices and idx < len(devices):
-            # 选择了某个设备，进入编辑/删除子菜单
-            config = _device_action_menu(config, idx)
+        elif idx in index_map:
+            config = _device_action_menu(config, index_map[idx])
 
     return config
 
@@ -177,6 +192,10 @@ def _add_device_ui(config: dict) -> dict:
             console.print("[red]设备名称不能为空[/red]")
             return None
         device["name"] = name
+
+        # 设备分组
+        group = input("设备分组/站点 (可选，如 Site-A): ").strip()
+        device["group"] = group
 
         # 设备默认IP
         device_ip = input("设备默认IP (如 10.251.251.251): ").strip()
@@ -270,6 +289,11 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
         name = input(f"设备名称 [{old_device['name']}]: ").strip()
         device["name"] = name if name else old_device["name"]
 
+        # 设备分组
+        old_group = old_device.get("group", "")
+        group = input(f"设备分组/站点 [{old_group}]: ").strip()
+        device["group"] = group if group else old_group
+
         # 设备IP
         device_ip = input(f"设备默认IP [{old_device['device_ip']}]: ").strip()
         device_ip = device_ip if device_ip else old_device["device_ip"]
@@ -358,6 +382,8 @@ def _display_device_summary(device: dict):
     table.add_column("值", style="white")
 
     table.add_row("设备名称", device.get("name", ""))
+    group = device.get("group", "")
+    table.add_row("分组/站点", group if group else "[未分组]")
     table.add_row("设备IP", device.get("device_ip", ""))
     table.add_row("IP策略", "自动计算" if device.get("ip_mode") == "auto" else f"手动: {device.get('adapter_ip', '')}")
     table.add_row("子网掩码", device.get("subnet_mask", ""))
