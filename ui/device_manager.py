@@ -58,17 +58,17 @@ def _pick_option(options: list, title: str, default_index: int = 0,
             nav_prompt = f" (第{current_page + 1}/{total_pages}页)"
             console.print(f"  [dim]{' | '.join(bottom_options)}{nav_prompt}[/dim]")
 
-        # 固定尾部选项
+        # 固定尾部选项（按当前页末尾编号显示，返回总偏移索引）
         for i, ft in enumerate(fixed_tail):
-            num = total + i + 1
-            console.print(f"  {num}. {ft}")
+            display_num = fixed_base + i + 1
+            console.print(f"  {display_num}. {ft}")
 
         if allow_back:
             console.print(f"   0. <-- 返回上一页")
         console.print("-" * 55)
 
         try:
-            prompt = f"请输入序号 (1-{total_with_fixed}"
+            prompt = f"请输入序号 (1-{max(total, fixed_base + len(fixed_tail))}"
             if allow_back:
                 prompt += ", 0=返回"
             if total_pages > 1:
@@ -97,9 +97,12 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
         try:
             idx = int(choice) - 1
-            if 0 <= idx < total_with_fixed:
+            # 固定尾部选项：按位置映射回 total 偏移返回
+            if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
+                return total + (idx - fixed_base)
+            if 0 <= idx < total:
                 return idx
-            hint = f"1-{total_with_fixed}"
+            hint = f"1-{max(total, fixed_base + len(fixed_tail))}"
             if allow_back:
                 hint += " 或 0 返回"
             if total_pages > 1:

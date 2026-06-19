@@ -31,7 +31,7 @@ def _pick_option(options: list, title: str, default_index: int = 0,
                  fixed_tail: list = None) -> int:
     """
     自定义数字选择菜单，支持自动分页和固定尾部选项。
-    fixed_tail: 始终显示在底部的选项（不参与分页），按总长度偏移编号。
+    fixed_tail: 始终显示在底部的选项，按当前页末尾编号。
     返回 -1 表示返回，>=0 表示选项索引。
     """
     if not options:
@@ -39,7 +39,6 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
     fixed_tail = fixed_tail or []
     total = len(options)
-    total_with_fixed = total + len(fixed_tail)
     total_pages = max(1, (total + page_size - 1) // page_size)
     current_page = 0
 
@@ -47,6 +46,7 @@ def _pick_option(options: list, title: str, default_index: int = 0,
         start = current_page * page_size
         end = min(start + page_size, total)
         page_items = options[start:end]
+        fixed_base = min(start + page_size, total)
 
         console.print(f"\n[bold cyan]{title}[/bold cyan]")
         console.print("-" * 55)
@@ -55,7 +55,7 @@ def _pick_option(options: list, title: str, default_index: int = 0,
             marker = " > " if (start + i) == default_index else "   "
             console.print(f"{marker}{num}. {opt}")
 
-        # 分页导航（在固定选项前）
+        # 分页导航
         if total_pages > 1:
             bottom_options = []
             if current_page > 0:
@@ -65,17 +65,18 @@ def _pick_option(options: list, title: str, default_index: int = 0,
             nav_prompt = f" (第{current_page + 1}/{total_pages}页)"
             console.print(f"  [dim]{' | '.join(bottom_options)}{nav_prompt}[/dim]")
 
-        # 固定尾部选项
+        # 固定尾部选项（按当前页末尾编号显示，返回总偏移索引）
         for i, ft in enumerate(fixed_tail):
-            num = total + i + 1
-            console.print(f"  {num}. {ft}")
+            display_num = fixed_base + i + 1
+            console.print(f"  {display_num}. {ft}")
 
         if allow_back:
             console.print(f"   0. <-- 返回上一页")
         console.print("-" * 55)
 
+        max_valid = max(total, fixed_base + len(fixed_tail))
         try:
-            prompt = f"请输入序号 (1-{total_with_fixed}"
+            prompt = f"请输入序号 (1-{max_valid}"
             if allow_back:
                 prompt += ", 0=返回"
             if total_pages > 1:
@@ -104,9 +105,12 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
         try:
             idx = int(choice) - 1
-            if 0 <= idx < total_with_fixed:
+            # 固定尾部选项：按位置映射回 total 偏移返回
+            if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
+                return total + (idx - fixed_base)
+            if 0 <= idx < total:
                 return idx
-            hint = f"1-{total_with_fixed}"
+            hint = f"1-{max_valid}"
             if allow_back:
                 hint += " 或 0 返回"
             if total_pages > 1:
