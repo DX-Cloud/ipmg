@@ -157,7 +157,9 @@ def _pick_grouped_device(config: dict, title: str) -> tuple:
                 ip_preview = "-> 网卡IP: 计算失败"
             mgmt_url = resolve_management_url(d)
             url_status = " [Web]" if mgmt_url else ""
-            pick_options.append(f"  [{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}")
+            line = f"  [{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}"
+            console.print(f"  {pick_idx + 1}. {line}")
+            pick_options.append(line)
             for gi, gd in enumerate(all_devices):
                 if gd is d:
                     index_map[pick_idx] = gi
