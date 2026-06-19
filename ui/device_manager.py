@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from core.config_manager import (
-    get_devices, add_device, update_device, delete_device,
+    add_device, update_device, delete_device,
     save_config, validate_device, get_device_groups, get_devices_by_group
 )
 from core.network_utils import (
@@ -117,7 +117,6 @@ def show_device_manager(config: dict) -> dict:
     while True:
         show_header(config)
 
-        all_devices = get_devices(config)
         by_group = get_devices_by_group(config)
         groups = get_device_groups(config)
 
@@ -133,6 +132,7 @@ def show_device_manager(config: dict) -> dict:
         options = []
         index_map = {}
         opt_idx = 0
+        raw_devices = config.get("devices", [])  # 原始顺序
 
         if by_group:
             for g in groups:
@@ -143,9 +143,10 @@ def show_device_manager(config: dict) -> dict:
                     options.append(
                         f"  [{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
                     )
-                    for gi, gd in enumerate(all_devices):
-                        if gd is d:
-                            index_map[opt_idx] = gi
+                    # 用原始 config["devices"] 索引，不是排序后的索引
+                    for ri, rd in enumerate(raw_devices):
+                        if rd is d:
+                            index_map[opt_idx] = ri
                             break
                     opt_idx += 1
 
@@ -172,11 +173,11 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
     """设备操作子菜单（编辑/删除/收藏）"""
     show_header(config)
 
-    devices = get_devices(config)
-    if device_idx >= len(devices):
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
         return config
 
-    device = devices[device_idx]
+    device = raw_devices[device_idx]
 
     options = [
         "[E] 编辑设备",
@@ -224,11 +225,11 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
 
 def _set_device_group_ui(config: dict, device_idx: int) -> dict:
     """设置设备分组（选择已有分组或新建分组）"""
-    devices = get_devices(config)
-    if device_idx >= len(devices):
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
         return config
 
-    device = devices[device_idx]
+    device = raw_devices[device_idx]
     current_group = device.get("group", "") or "未分组"
 
     while True:
@@ -386,11 +387,11 @@ def _add_device_ui(config: dict) -> dict:
 
 def _edit_device_ui(config: dict, device_idx: int) -> dict:
     """编辑已有设备（同添加流程，预填充已有值）"""
-    devices = get_devices(config)
-    if device_idx >= len(devices):
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
         return None
 
-    old_device = devices[device_idx]
+    old_device = raw_devices[device_idx]
 
     try:
         device = {}
