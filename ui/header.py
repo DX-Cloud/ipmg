@@ -22,7 +22,7 @@ def show_header(config: dict = None):
     os.system('cls')
 
     console.print("[bold]========================================[/bold]")
-    console.print("[bold]     网络设备IP一键配置工具 v1.0[/bold]")
+    console.print("[bold]     网络设备IP一键配置工具 v1.1[/bold]")
     console.print("[bold]========================================[/bold]")
 
     if config is not None:

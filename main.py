@@ -6,6 +6,7 @@
 import sys
 import os
 import ctypes
+import subprocess
 
 # 设置控制台为 UTF-8 编码
 if sys.platform == "win32":
@@ -28,22 +29,36 @@ def is_admin() -> bool:
 def run_as_admin():
     """以管理员权限重新启动程序"""
     try:
-        script = os.path.abspath(sys.argv[0])
-        params = " ".join([script] + sys.argv[1:])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        if getattr(sys, "frozen", False):
+            # PyInstaller 打包后的 exe：可执行文件即程序本体，参数只传原始 argv
+            exe = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:])
+        else:
+            # 源码运行：先传 python.exe，再传带引号的脚本路径和参数
+            exe = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            params = f'"{script}"'
+            if sys.argv[1:]:
+                params += " " + subprocess.list2cmdline(sys.argv[1:])
+
+        # ShellExecuteW 返回值 > 32 表示成功；<= 32（如用户取消 UAC）视为失败
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if result <= 32:
+            return False
+        # 提权成功，父进程退出，由新的管理员进程接管
         sys.exit(0)
     except Exception:
-        pass
+        return False
 
 
 def main():
     """主入口"""
     # 管理员权限检测 - 自动提权
     if not is_admin():
-        run_as_admin()
-        # 如果提权失败，仍然继续运行
-        print("[!] 警告: 管理员提权失败，部分功能可能不可用")
-        input("按回车键继续...")
+        if not run_as_admin():
+            # 提权失败或用户取消，仍然继续运行（部分功能可能不可用）
+            print("[!] 警告: 管理员提权失败，部分功能可能不可用")
+            input("按回车键继续...")
 
     # 导入模块（延迟导入，加快启动感知速度）
     from core.config_manager import load_config, save_config

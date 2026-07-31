@@ -21,15 +21,16 @@ console = Console()
 
 def _pick_option(options: list, title: str, default_index: int = 0,
                  allow_back: bool = True, page_size: int = 9,
-                 fixed_tail: list = None) -> int:
+                 fixed_tail: list = None, non_selectable: set = None) -> int:
     """
     自定义数字选择菜单，支持自动分页和固定尾部选项。
-    fixed_tail: 始终显示在底部的选项（不参与分页），按总长度偏移编号。
+    non_selectable: 不可选中的选项索引集合（如分组标题），选中时提示错误。
     返回 -1 表示返回，>=0 表示选项索引。
     """
     if not options:
         return -1
 
+    non_selectable = non_selectable or set()
     fixed_tail = fixed_tail or []
     total = len(options)
     total_pages = max(1, (total + page_size - 1) // page_size)
@@ -45,8 +46,12 @@ def _pick_option(options: list, title: str, default_index: int = 0,
         console.print("-" * 55)
         for i, opt in enumerate(page_items):
             num = start + i + 1
-            marker = " > " if (start + i) == default_index else "   "
-            console.print(f"{marker}{num}. {opt}")
+            global_idx = start + i
+            if global_idx in non_selectable:
+                console.print(f"     {opt}")
+            else:
+                marker = " > " if global_idx == default_index else "   "
+                console.print(f"{marker}{num}. {opt}")
 
         # 分页导航（在固定选项前）
         if total_pages > 1:
@@ -97,7 +102,9 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
         try:
             idx = int(choice) - 1
-            # 固定尾部选项：按位置映射回 total 偏移返回
+            if idx in non_selectable:
+                console.print("[red]请选择设备，不能选择分组标题[/red]")
+                continue
             if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
                 return total + (idx - fixed_base)
             if 0 <= idx < total:
@@ -113,29 +120,26 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
 
 def show_device_manager(config: dict) -> dict:
-    """设备管理主菜单 - 按分组展示"""
+    """设备管理主菜单 - 按分组展示（分组标题嵌入选项列表）"""
     while True:
         show_header(config)
 
         by_group = get_devices_by_group(config)
         groups = get_device_groups(config)
 
-        # 先打印分组标题
-        if by_group:
-            for g in groups:
-                label = f"── [{g}] ──" if g else "── [未分组] ──"
-                console.print(f"  [bold]{label}[/bold]")
-        else:
-            console.print("[yellow]当前没有设备配置[/yellow]")
-
-        # 只将设备项交给 _pick_option（分组标题单独打印）
         options = []
         index_map = {}
+        non_selectable = set()
         opt_idx = 0
         raw_devices = config.get("devices", [])
 
         if by_group:
             for g in groups:
+                label = f"── [{g}] ──" if g else "── [未分组] ──"
+                options.append(label)
+                non_selectable.add(opt_idx)
+                opt_idx += 1
+
                 devices = by_group.get(g, [])
                 for d in devices:
                     fav = "*" if d.get("favorite") else " "
@@ -145,16 +149,20 @@ def show_device_manager(config: dict) -> dict:
                     if group_tag:
                         display += f" | [{group_tag}]"
                     options.append(display)
-                    # 用原始 config["devices"] 索引，不是排序后的索引
                     for ri, rd in enumerate(raw_devices):
                         if rd is d:
                             index_map[opt_idx] = ri
                             break
                     opt_idx += 1
+        else:
+            options.append("[yellow]当前没有设备配置[/yellow]")
 
+        # 默认索引指向第一个可选项（分组标题不可选）
+        first_selectable = 1 if by_group else 0
         idx = _pick_option(options, "设备管理 - 请选择设备或操作",
-                           page_size=8,
-                           fixed_tail=["[+] 添加新设备"])
+                           page_size=8, default_index=first_selectable,
+                           fixed_tail=["[+] 添加新设备"],
+                           non_selectable=non_selectable)
         if idx < 0:
             return config
 
@@ -443,7 +451,8 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
                 preview_ip = calculate_adapter_ip_auto(device_ip, mask)
                 console.print(f"[cyan]-> 自动计算网卡IP: {preview_ip}[/cyan]")
             except ValueError as e:
-                console.print(f"[yellow][!] 自动计算警告: {e}[/yellow]")
+                console.print(f"[red]自动计算失败: {e}[/red]")
+                return None
         else:
             device["ip_mode"] = "manual"
             old_adapter_ip = old_device.get("adapter_ip", "")

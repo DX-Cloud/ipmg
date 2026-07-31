@@ -13,7 +13,7 @@ from core.adapter_manager import get_network_adapters, select_adapter
 from core.config_manager import (
     load_config, save_config, get_devices, set_last_adapter_mac,
     get_last_adapter_mac, export_config, import_config, get_adapter_backup,
-    get_ip_history, pop_adapter_backup
+    get_ip_history, get_adapter_backup_stack, pop_adapter_backup
 )
 from core.network_utils import resolve_adapter_ip, resolve_management_url, ping_host
 from core.ip_configurator import set_static_ip, set_dhcp, get_current_ip_config
@@ -28,15 +28,16 @@ console = Console()
 
 def _pick_option(options: list, title: str, default_index: int = 0,
                  allow_back: bool = True, page_size: int = 9,
-                 fixed_tail: list = None) -> int:
+                 fixed_tail: list = None, non_selectable: set = None) -> int:
     """
     自定义数字选择菜单，支持自动分页和固定尾部选项。
-    fixed_tail: 始终显示在底部的选项，按当前页末尾编号。
+    non_selectable: 不可选中的选项索引集合（如分组标题）。
     返回 -1 表示返回，>=0 表示选项索引。
     """
     if not options:
         return -1
 
+    non_selectable = non_selectable or set()
     fixed_tail = fixed_tail or []
     total = len(options)
     total_pages = max(1, (total + page_size - 1) // page_size)
@@ -52,8 +53,12 @@ def _pick_option(options: list, title: str, default_index: int = 0,
         console.print("-" * 55)
         for i, opt in enumerate(page_items):
             num = start + i + 1
-            marker = " > " if (start + i) == default_index else "   "
-            console.print(f"{marker}{num}. {opt}")
+            global_idx = start + i
+            if global_idx in non_selectable:
+                console.print(f"     {opt}")
+            else:
+                marker = " > " if global_idx == default_index else "   "
+                console.print(f"{marker}{num}. {opt}")
 
         # 分页导航
         if total_pages > 1:
@@ -105,6 +110,9 @@ def _pick_option(options: list, title: str, default_index: int = 0,
 
         try:
             idx = int(choice) - 1
+            if idx in non_selectable:
+                console.print("[red]该项不可选择[/red]")
+                continue
             # 固定尾部选项：按位置映射回 total 偏移返回
             if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
                 return total + (idx - fixed_base)
@@ -406,7 +414,10 @@ def run_configure_flow(config: dict) -> dict:
 
         # 保存配置（备份+MAC记忆）
         set_last_adapter_mac(config, selected_adapter.mac)
-        save_config(config)
+        try:
+            save_config(config)
+        except Exception as e:
+            console.print(f"[yellow][!] 配置保存失败（不影响本次IP配置）: {e}[/yellow]")
 
         # Step 9: Ping验证
         console.print(f"\n[bold cyan]正在Ping设备 {selected_device['device_ip']} 验证连通性...[/bold cyan]")
@@ -475,7 +486,6 @@ def run_restore_flow(config: dict) -> dict:
 
         # Step 2: 获取历史记录 + 撤销栈
         history = get_ip_history(config, selected_adapter.mac)
-        from core.config_manager import get_adapter_backup_stack
         backup_stack = get_adapter_backup_stack(config, selected_adapter.mac)
 
         # 构建选项列表：DHCP + 撤销栈 + 历史记录
@@ -555,6 +565,7 @@ def _do_restore_dhcp(config: dict, adapter) -> dict:
 def _do_undo_restore(config: dict, adapter, backup: dict) -> dict:
     """
     执行撤销恢复（从备份栈弹出并应用）。
+    先定位目标备份并应用成功后再弹出；失败时备份栈保持不变，可重试。
     非目标版本自动跳过，直到应用到选中版本。
     """
     console.print(f"\n[bold]--- 撤销确认 ---[/bold]")
@@ -568,43 +579,57 @@ def _do_undo_restore(config: dict, adapter, backup: dict) -> dict:
         input("\n按回车键返回...")
         return config
 
-    # 弹出直到目标版本
-    skipped = 0
-    while True:
-        bk, config = pop_adapter_backup(config, adapter.mac)
-        if bk is None:
-            console.print("[red][X] 备份栈为空，无法撤销[/red]")
+    # 在栈中定位目标备份（优先对象同一性，其次按内容匹配，避免依赖可变对象引用）
+    stack = get_adapter_backup_stack(config, adapter.mac)
+    target_pos = None
+    for i, bk in enumerate(stack):
+        if bk is backup or (
+            bk.get("ip") == backup.get("ip")
+            and bk.get("mask") == backup.get("mask")
+            and bk.get("gateway") == backup.get("gateway")
+            and bool(bk.get("is_dhcp")) == bool(backup.get("is_dhcp"))
+            and bk.get("timestamp") == backup.get("timestamp")
+        ):
+            target_pos = i
             break
 
-        if bk is backup:
-            try:
-                if bk.get("is_dhcp", True):
-                    result = set_dhcp(adapter.name)
-                    if not result:
-                        console.print("[red][X] 撤销DHCP失败[/red]")
-                        break
-                    console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
-                else:
-                    result = set_static_ip(
-                        adapter.name,
-                        bk.get("ip", ""),
-                        bk.get("mask", "255.255.255.0"),
-                        bk.get("gateway", "") or None,
-                    )
-                    if not result:
-                        console.print("[red][X] 撤销静态IP失败[/red]")
-                        break
-                    console.print(f"[green][OK] 已恢复为静态IP: {bk.get('ip', '')}[/green]")
+    if target_pos is None:
+        console.print("[red][X] 备份栈中未找到该版本，可能已被其他操作清除[/red]")
+        input("\n按回车键返回...")
+        return config
 
-                log_operation("撤销IP", adapter.name, result=f"撤销到 {bk.get('ip', 'DHCP')}")
-                if skipped > 0:
-                    console.print(f"[dim]跳过 {skipped} 级中间版本[/dim]")
-            except RuntimeError as e:
-                console.print(f"[red][X] 撤销失败: {e}[/red]")
-            break
+    target = stack[target_pos]
 
-        skipped += 1
-        console.print(f"  [dim]跳过中间版本: {bk.get('ip', 'DHCP')}[/dim]")
+    # 先应用目标版本，成功后再弹出（失败时栈保持不变）
+    try:
+        if target.get("is_dhcp", True):
+            result = set_dhcp(adapter.name)
+            if not result:
+                console.print("[red][X] 撤销DHCP失败[/red]")
+                input("\n按回车键返回...")
+                return config
+            console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
+        else:
+            result = set_static_ip(
+                adapter.name,
+                target.get("ip", ""),
+                target.get("mask", "255.255.255.0"),
+                target.get("gateway", "") or None,
+            )
+            if not result:
+                console.print("[red][X] 撤销静态IP失败[/red]")
+                input("\n按回车键返回...")
+                return config
+            console.print(f"[green][OK] 已恢复为静态IP: {target.get('ip', '')}[/green]")
+
+        # 应用成功：弹出目标及其之上的中间版本
+        for _ in range(target_pos + 1):
+            _, config = pop_adapter_backup(config, adapter.mac)
+        if target_pos > 0:
+            console.print(f"[dim]跳过 {target_pos} 级中间版本[/dim]")
+        log_operation("撤销IP", adapter.name, result=f"撤销到 {target.get('ip', 'DHCP')}")
+    except RuntimeError as e:
+        console.print(f"[red][X] 撤销失败: {e}[/red]")
 
     save_config(config)
     input("\n按回车键返回...")
@@ -672,7 +697,12 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
             if confirm != "y":
                 return config
 
-            new_config = import_config(path)
+            try:
+                new_config = import_config(path)
+            except ValueError as e:
+                console.print(f"[red][X] 导入失败: {e}[/red]")
+                input("\n按回车键返回...")
+                return config
             save_config(new_config)
             console.print("[green][OK] 配置导入成功[/green]")
             log_operation("导入配置", result=f"路径={path}")

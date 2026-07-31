@@ -151,6 +151,8 @@ def _mac_to_str(physical_address, length) -> str:
     """将MAC地址字节数组转为字符串"""
     if length == 0:
         return ""
+    # 防止部分隧道适配器上报超长地址导致越界读取结构体相邻字段
+    length = min(int(length), MAX_ADAPTER_ADDRESS_LENGTH)
     return ":".join(f"{physical_address[i]:02X}" for i in range(length))
 
 
@@ -224,6 +226,7 @@ def get_network_adapters() -> List[NetworkAdapter]:
     # 遍历链表
     current = ptr_adapter_addresses
     while current:
+        adapter = None
         try:
             adapter = current.contents
 
@@ -256,7 +259,7 @@ def get_network_adapters() -> List[NetworkAdapter]:
                     if ip_str and ":" not in ip_str:  # 只要IPv4
                         # 获取子网掩码
                         prefix_len = uni.OnLinkPrefixLength
-                        mask = _prefix_length_to_mask(prefix_len) if prefix_len else "255.255.255.0"
+                        mask = _prefix_length_to_mask(prefix_len)
                         ip_addresses.append({"ip": ip_str, "mask": mask})
                 except Exception:
                     pass
@@ -275,7 +278,10 @@ def get_network_adapters() -> List[NetworkAdapter]:
         except Exception:
             pass
 
-        if hasattr(adapter, 'Next') and adapter.Next:
+        # adapter 读取失败时无法安全前进，直接终止遍历
+        if adapter is None:
+            break
+        if adapter.Next:
             current = adapter.Next
         else:
             break

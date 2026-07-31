@@ -54,6 +54,9 @@ def _get_default_config() -> dict:
 def _normalize_device(device: dict) -> dict:
     """规范化设备配置，补充缺失字段"""
     normalized = copy.deepcopy(DEVICE_DEFAULTS)
+    if not isinstance(device, dict):
+        # 非字典设备项直接返回默认空设备，避免崩溃
+        return normalized
     for key, default_val in normalized.items():
         if key in device:
             normalized[key] = device[key]
@@ -82,7 +85,7 @@ def load_config(config_path: str = None) -> dict:
             config = _get_default_config()
 
         # 确保顶层结构完整
-        if "devices" not in config:
+        if "devices" not in config or not isinstance(config["devices"], list):
             config["devices"] = []
         if "network_adapters" not in config:
             config["network_adapters"] = {"last_selected_mac": ""}
@@ -94,8 +97,10 @@ def load_config(config_path: str = None) -> dict:
         # 迁移旧版备份格式
         config = _migrate_backup_format(config)
 
-        # 规范化每个设备配置
-        config["devices"] = [_normalize_device(d) for d in config["devices"]]
+        # 规范化每个设备配置（跳过非字典项，避免手工编辑导致的启动崩溃）
+        config["devices"] = [
+            _normalize_device(d) for d in config["devices"] if isinstance(d, dict)
+        ]
 
         return config
 
@@ -124,7 +129,7 @@ def _migrate_backup_format(config: dict) -> dict:
                 "gateway": backup.get("gateway", ""),
                 "is_dhcp": backup.get("is_dhcp", True),
                 "adapter_name": backup.get("adapter_name", ""),
-                "timestamp": backup.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M")),
+                "timestamp": backup.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             }]
             migrated = True
         elif isinstance(backup, list):
@@ -310,8 +315,27 @@ def export_config(config: dict, export_path: str) -> None:
 def import_config(import_path: str) -> dict:
     """
     从指定路径导入配置。
-    验证必要字段，缺失字段使用默认值填充。
+    先严格校验文件结构与字段类型，避免损坏/非配置文件覆盖现有配置。
+    校验通过后按常规流程规范化（缺失字段使用默认值填充）。
     """
+    try:
+        with open(import_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"配置文件解析失败: {e}") from e
+    except OSError as e:
+        raise ValueError(f"无法读取文件: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("配置格式无效：顶层必须是映射（字典）")
+
+    devices = data.get("devices", [])
+    if not isinstance(devices, list):
+        raise ValueError("配置格式无效：devices 必须是列表")
+    for i, d in enumerate(devices):
+        if not isinstance(d, dict):
+            raise ValueError(f"配置格式无效：第 {i + 1} 个设备配置不是映射")
+
     return load_config(import_path)
 
 
@@ -332,7 +356,9 @@ def validate_device(device: dict) -> list:
             errors.append("设备IP格式无效")
         else:
             try:
-                [int(p) for p in parts]
+                nums = [int(p) for p in parts]
+                if any(n < 0 or n > 255 for n in nums):
+                    errors.append("设备IP格式无效")
             except ValueError:
                 errors.append("设备IP格式无效")
 
@@ -377,7 +403,7 @@ def add_ip_history(config: dict, mac: str, ip: str, mask: str, gateway: str, is_
         "ip": ip,
         "mask": mask,
         "gateway": gateway or "",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     # 去重：检查是否已存在相同配置
