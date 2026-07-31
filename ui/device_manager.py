@@ -8,107 +8,76 @@ from rich.console import Console
 from rich.table import Table
 
 from core.config_manager import (
-    get_devices, add_device, update_device, delete_device,
-    save_config, validate_device
+    add_device, update_device, delete_device,
+    save_config, validate_device, get_device_groups, get_devices_by_group
 )
 from core.network_utils import (
     calculate_adapter_ip_auto, validate_ip, validate_subnet_mask
 )
+from ui import widgets
 from ui.header import show_header
 
 console = Console()
 
 
-def _pick_option(options: list, title: str, default_index: int = 0,
-                 allow_back: bool = True) -> int:
-    """
-    自定义数字选择菜单。
-    显示选项列表，用户输入数字选择，返回选择索引。
-    自动在末尾添加 "0. 返回" 选项。
-    返回 -1 表示用户选择返回。
-    """
-    all_options = list(options)
-    if allow_back:
-        all_options.append("<-- 返回上一页")
-
-    while True:
-        console.print(f"\n[bold cyan]{title}[/bold cyan]")
-        console.print("-" * 55)
-        for i, opt in enumerate(all_options):
-            num = i + 1
-            if allow_back and i == len(all_options) - 1:
-                # 返回选项用 0 作为快捷键
-                console.print(f"   0. {opt}")
-            else:
-                marker = " > " if i == default_index else "   "
-                console.print(f"{marker}{num}. {opt}")
-        console.print("-" * 55)
-
-        try:
-            prompt = f"请输入序号 (默认 {default_index + 1}"
-            if allow_back:
-                prompt += ", 0=返回"
-            prompt += "): "
-            choice = input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            return -1
-
-        if not choice:
-            return default_index
-
-        # 处理返回
-        if allow_back and choice == "0":
-            return -1
-
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(options):
-                return idx
-            else:
-                max_num = len(options)
-                hint = f"1-{max_num}"
-                if allow_back:
-                    hint += " 或 0 返回"
-                console.print(f"[red]无效输入，请输入 {hint}[/red]")
-        except ValueError:
-            console.print("[red]请输入数字[/red]")
-
-
 def show_device_manager(config: dict) -> dict:
-    """设备管理主菜单"""
+    """设备管理主菜单 - 按分组展示（分组标题嵌入选项列表）"""
     while True:
         show_header(config)
 
-        devices = get_devices(config)
+        by_group = get_devices_by_group(config)
+        groups = get_device_groups(config)
+
         options = []
+        index_map = {}
+        non_selectable = set()
+        opt_idx = 0
+        raw_devices = config.get("devices", [])
 
-        if devices:
-            for i, d in enumerate(devices):
-                fav = "*" if d.get("favorite") else " "
-                ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
-                options.append(
-                    f"[{fav}] {d['name']} | 设备IP: {d['device_ip']} | 模式: {ip_mode}"
-                )
+        if by_group:
+            for g in groups:
+                label = f"── [{g}] ──" if g else "── [未分组] ──"
+                options.append(label)
+                non_selectable.add(opt_idx)
+                opt_idx += 1
+
+                devices = by_group.get(g, [])
+                for d in devices:
+                    fav = "*" if d.get("favorite") else " "
+                    ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
+                    group_tag = d.get("group", "")
+                    display = f"[{fav}] {d['name']} | {d['device_ip']} | {ip_mode}"
+                    if group_tag:
+                        display += f" | [{group_tag}]"
+                    options.append(display)
+                    for ri, rd in enumerate(raw_devices):
+                        if rd is d:
+                            index_map[opt_idx] = ri
+                            break
+                    opt_idx += 1
         else:
-            console.print("[yellow]当前没有设备配置[/yellow]")
+            options.append("[yellow]当前没有设备配置[/yellow]")
 
-        options.append("[+] 添加新设备")
-
-        idx = _pick_option(options, "设备管理 - 请选择设备或操作")
+        # 默认索引指向第一个可选项（分组标题不可选）
+        first_selectable = 1 if by_group else 0
+        idx = widgets.pick_option(
+            options, "设备管理 - 请选择设备或操作",
+            page_size=8, default_index=first_selectable,
+            fixed_tail=["[+] 添加新设备"],
+            non_selectable=non_selectable,
+        )
         if idx < 0:
             return config
 
-        if idx == len(options) - 1:
-            # 添加新设备
+        if idx >= len(options):
             result = _add_device_ui(config)
             if result:
                 config = result
                 save_config(config)
                 console.print("[green][OK] 设备添加成功[/green]")
                 input("\n按回车键继续...")
-        elif devices and idx < len(devices):
-            # 选择了某个设备，进入编辑/删除子菜单
-            config = _device_action_menu(config, idx)
+        elif idx in index_map:
+            config = _device_action_menu(config, index_map[idx])
 
     return config
 
@@ -117,19 +86,20 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
     """设备操作子菜单（编辑/删除/收藏）"""
     show_header(config)
 
-    devices = get_devices(config)
-    if device_idx >= len(devices):
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
         return config
 
-    device = devices[device_idx]
+    device = raw_devices[device_idx]
 
     options = [
         "[E] 编辑设备",
         "[D] 删除设备",
+        "[G] 设置分组",
         f"{'[*] 取消收藏' if device.get('favorite') else '[*] 设为收藏'}",
     ]
 
-    idx = _pick_option(
+    idx = widgets.pick_option(
         options,
         f"设备: {device['name']} ({device['device_ip']}) - 请选择操作"
     )
@@ -137,7 +107,6 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
         return config
 
     if idx == 0:
-        # 编辑
         result = _edit_device_ui(config, device_idx)
         if result:
             config = result
@@ -146,16 +115,16 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
             input("\n按回车键继续...")
 
     elif idx == 1:
-        # 删除
-        confirm = input(f"确认删除设备 '{device['name']}'？(y/N): ").strip().lower()
-        if confirm == "y":
+        if widgets.confirm(f"确认删除设备 '{device['name']}'?", default=False):
             delete_device(config, device_idx)
             save_config(config)
             console.print("[green][OK] 设备已删除[/green]")
             input("\n按回车键继续...")
 
     elif idx == 2:
-        # 收藏
+        config = _set_device_group_ui(config, device_idx)
+
+    elif idx == 3:
         device["favorite"] = not device.get("favorite", False)
         update_device(config, device_idx, device)
         save_config(config)
@@ -164,6 +133,74 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
         input("\n按回车键继续...")
 
     return config
+
+
+def _set_device_group_ui(config: dict, device_idx: int) -> dict:
+    """设置设备分组（选择已有分组或新建分组）"""
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
+        return config
+
+    device = raw_devices[device_idx]
+    current_group = device.get("group", "") or "未分组"
+
+    while True:
+        show_header(config)
+        console.print(f"\n[bold cyan]设备: {device['name']} | 当前分组: {current_group}[/bold cyan]")
+
+        mode_options = [
+            "选择已有分组",
+            "新建分组",
+        ]
+        mode_idx = widgets.pick_option(mode_options, "请选择操作")
+        if mode_idx < 0:
+            return config
+
+        if mode_idx == 0:
+            # 选择已有分组
+            groups = get_device_groups(config)
+            group_options = []
+            group_map = {}
+            for i, g in enumerate(groups):
+                label = g if g else "未分组"
+                group_options.append(label)
+                group_map[i] = g
+
+            if not group_options:
+                console.print("[yellow][!] 暂无分组，请先新建[/yellow]")
+                input("\n按回车键继续...")
+                continue
+
+            g_idx = widgets.pick_option(group_options, "请选择分组", page_size=8)
+            if g_idx < 0:
+                continue
+
+            selected_group = group_map.get(g_idx, "")
+            device["group"] = selected_group
+            update_device(config, device_idx, device)
+            save_config(config)
+            old_label = current_group
+            new_label = selected_group if selected_group else "未分组"
+            console.print(f"[green][OK] 分组已更改: {old_label} -> {new_label}[/green]")
+            input("\n按回车键返回...")
+            return config
+
+        else:
+            # 新建分组
+            new_group = input("请输入新分组名称: ").strip()
+            if not new_group:
+                console.print("[red]分组名称不能为空[/red]")
+                continue
+
+            if not widgets.confirm(f"确认将设备 '{device['name']}' 加入分组 '{new_group}'?", default=True):
+                continue
+
+            device["group"] = new_group
+            update_device(config, device_idx, device)
+            save_config(config)
+            console.print(f"[green][OK] 设备已加入分组: {new_group}[/green]")
+            input("\n按回车键返回...")
+            return config
 
 
 def _add_device_ui(config: dict) -> dict:
@@ -177,6 +214,10 @@ def _add_device_ui(config: dict) -> dict:
             console.print("[red]设备名称不能为空[/red]")
             return None
         device["name"] = name
+
+        # 设备分组
+        group = input("设备分组/站点 (可选，如 Site-A): ").strip()
+        device["group"] = group
 
         # 设备默认IP
         device_ip = input("设备默认IP (如 10.251.251.251): ").strip()
@@ -199,7 +240,7 @@ def _add_device_ui(config: dict) -> dict:
             "自动计算（取网段最后可用IP）",
             "手动指定网卡IP",
         ]
-        mode_idx = _pick_option(ip_mode_options, "选择网卡IP策略")
+        mode_idx = widgets.pick_option(ip_mode_options, "选择网卡IP策略")
         if mode_idx < 0:
             return None
 
@@ -244,8 +285,7 @@ def _add_device_ui(config: dict) -> dict:
         console.print()
         _display_device_summary(device)
 
-        confirm = input("\n确认保存？(Y/n): ").strip().lower()
-        if confirm == "n":
+        if not widgets.confirm("确认保存?", default=True):
             return None
 
         add_device(config, device)
@@ -257,11 +297,11 @@ def _add_device_ui(config: dict) -> dict:
 
 def _edit_device_ui(config: dict, device_idx: int) -> dict:
     """编辑已有设备（同添加流程，预填充已有值）"""
-    devices = get_devices(config)
-    if device_idx >= len(devices):
+    raw_devices = config.get("devices", [])
+    if device_idx >= len(raw_devices):
         return None
 
-    old_device = devices[device_idx]
+    old_device = raw_devices[device_idx]
 
     try:
         device = {}
@@ -269,6 +309,11 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
         # 设备名称
         name = input(f"设备名称 [{old_device['name']}]: ").strip()
         device["name"] = name if name else old_device["name"]
+
+        # 设备分组
+        old_group = old_device.get("group", "")
+        group = input(f"设备分组/站点 [{old_group}]: ").strip()
+        device["group"] = group if group else old_group
 
         # 设备IP
         device_ip = input(f"设备默认IP [{old_device['device_ip']}]: ").strip()
@@ -292,7 +337,7 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
             f"自动计算（当前: {current_mode}）",
             "手动指定网卡IP",
         ]
-        mode_idx = _pick_option(
+        mode_idx = widgets.pick_option(
             ip_mode_options,
             f"选择网卡IP策略 (当前: {current_mode})"
         )
@@ -306,7 +351,8 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
                 preview_ip = calculate_adapter_ip_auto(device_ip, mask)
                 console.print(f"[cyan]-> 自动计算网卡IP: {preview_ip}[/cyan]")
             except ValueError as e:
-                console.print(f"[yellow][!] 自动计算警告: {e}[/yellow]")
+                console.print(f"[red]自动计算失败: {e}[/red]")
+                return None
         else:
             device["ip_mode"] = "manual"
             old_adapter_ip = old_device.get("adapter_ip", "")
@@ -340,8 +386,7 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
         console.print()
         _display_device_summary(device)
 
-        confirm = input("\n确认保存修改？(Y/n): ").strip().lower()
-        if confirm == "n":
+        if not widgets.confirm("确认保存修改?", default=True):
             return None
 
         update_device(config, device_idx, device)
@@ -358,6 +403,8 @@ def _display_device_summary(device: dict):
     table.add_column("值", style="white")
 
     table.add_row("设备名称", device.get("name", ""))
+    group = device.get("group", "")
+    table.add_row("分组/站点", group if group else "[未分组]")
     table.add_row("设备IP", device.get("device_ip", ""))
     table.add_row("IP策略", "自动计算" if device.get("ip_mode") == "auto" else f"手动: {device.get('adapter_ip', '')}")
     table.add_row("子网掩码", device.get("subnet_mask", ""))

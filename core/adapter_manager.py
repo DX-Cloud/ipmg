@@ -28,6 +28,13 @@ IF_TYPE_SOFTWARE_LOOPBACK = 24
 IF_TYPE_ETHERNET_CSMACD = 6
 IF_TYPE_IEEE80211 = 71
 
+# 虚拟/特殊网卡关键词（用于默认过滤，避免选择噪音）
+VIRTUAL_ADAPTER_KEYWORDS = (
+    "vmware", "virtualbox", "virtual", "hyper-v", "vethernet", "wsl",
+    "蓝牙", "bluetooth", "tap", "tun", "vpn", "隧道", "loopback",
+    "npcap", "wintun", "pseudo",
+)
+
 # DLL
 iphlpapi = ctypes.windll.iphlpapi
 kernel32 = ctypes.windll.kernel32
@@ -151,6 +158,8 @@ def _mac_to_str(physical_address, length) -> str:
     """将MAC地址字节数组转为字符串"""
     if length == 0:
         return ""
+    # 防止部分隧道适配器上报超长地址导致越界读取结构体相邻字段
+    length = min(int(length), MAX_ADAPTER_ADDRESS_LENGTH)
     return ":".join(f"{physical_address[i]:02X}" for i in range(length))
 
 
@@ -183,11 +192,21 @@ def _prefix_length_to_mask(prefix_len: int) -> str:
     return socket.inet_ntoa(struct.pack("!I", mask))
 
 
-def get_network_adapters() -> List[NetworkAdapter]:
+def is_virtual_adapter(name: str = "", description: str = "") -> bool:
+    """
+    判断网卡是否为虚拟/特殊网卡（VMware、Hyper-V、WSL、蓝牙、VPN 等）。
+    基于友好名称与描述关键词匹配。
+    """
+    text = f"{name} {description}".lower()
+    return any(keyword in text for keyword in VIRTUAL_ADAPTER_KEYWORDS)
+
+
+def get_network_adapters(filter_virtual: bool = False) -> List[NetworkAdapter]:
     """
     获取所有活动网卡列表。
     使用 GetAdaptersAddresses API，避免 subprocess 开销。
     返回排除了回环网卡的活动网卡列表。
+    filter_virtual=True 时额外过滤虚拟网卡。
     """
     adapters = []
     buf_size = ctypes.wintypes.ULONG(15000)
@@ -224,6 +243,7 @@ def get_network_adapters() -> List[NetworkAdapter]:
     # 遍历链表
     current = ptr_adapter_addresses
     while current:
+        adapter = None
         try:
             adapter = current.contents
 
@@ -246,6 +266,11 @@ def get_network_adapters() -> List[NetworkAdapter]:
             mac = _mac_to_str(adapter.PhysicalAddress, adapter.PhysicalAddressLength)
             if_type = adapter.IfType
 
+            # 虚拟网卡过滤（用户可配置）
+            if filter_virtual and is_virtual_adapter(friendly_name, description):
+                current = adapter.Next
+                continue
+
             # 提取IPv4地址列表
             ip_addresses = []
             uni_addr = adapter.FirstUnicastAddress
@@ -256,7 +281,7 @@ def get_network_adapters() -> List[NetworkAdapter]:
                     if ip_str and ":" not in ip_str:  # 只要IPv4
                         # 获取子网掩码
                         prefix_len = uni.OnLinkPrefixLength
-                        mask = _prefix_length_to_mask(prefix_len) if prefix_len else "255.255.255.0"
+                        mask = _prefix_length_to_mask(prefix_len)
                         ip_addresses.append({"ip": ip_str, "mask": mask})
                 except Exception:
                     pass
@@ -275,7 +300,10 @@ def get_network_adapters() -> List[NetworkAdapter]:
         except Exception:
             pass
 
-        if hasattr(adapter, 'Next') and adapter.Next:
+        # adapter 读取失败时无法安全前进，直接终止遍历
+        if adapter is None:
+            break
+        if adapter.Next:
             current = adapter.Next
         else:
             break
