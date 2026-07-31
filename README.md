@@ -2,7 +2,7 @@
 
 > 一个 Windows 命令行 TUI 工具，专为网络工程师设计，用于一键切换网卡的 IP 配置以对接不同管理网段的网络设备（交换机、路由器、防火墙、AP、AC 等）。
 
-> 本项目完全由Vibe Coding完成(Model:GLM-5.1 | IDE:VSCode | Agent:Costrict)。
+> 本项目完全由Vibe Coding完成(Model:DeepSeek V4 Flash 正式版 | Tool:Codex)。
 
 ## 目录
 
@@ -587,4 +587,4 @@ A: 支持。无线网卡也会在网卡列表中显示，但需要注意 WiFi �
 
 ## License
 
-[MIT](LICENSE)
+本项目采用 MIT 开源协议发布，完整许可文本见 [LICENSE](LICENSE)。
