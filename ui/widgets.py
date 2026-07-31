@@ -14,6 +14,20 @@ from rich.text import Text
 
 console = Console()
 
+# 键盘模式上一帧内容（用于同一菜单续驻时首帧原地覆盖）
+_LAST_FRAME: List[str] = []
+
+
+def reset_last_frame() -> None:
+    """清除上一帧记忆（页面发生全屏重绘后调用）。"""
+    global _LAST_FRAME
+    _LAST_FRAME = []
+
+
+def _remember_frame(lines: Sequence[str]) -> None:
+    global _LAST_FRAME
+    _LAST_FRAME = list(lines)
+
 
 def copy_to_clipboard(text: str) -> bool:
     """复制文本到剪贴板（win32clipboard，pywin32 依赖）。"""
@@ -155,15 +169,22 @@ def _frame_text(lines: Sequence[str]) -> str:
 def _clear_and_redraw(lines: Sequence[str], prev_lines: Sequence[str]) -> None:
     """
     键盘模式原地刷新。
-    将"光标上移 + 清空旧区域 + 整个新帧"合并为一次终端写入，
-    避免清屏与重绘之间存在可见空白导致闪烁。
+    采用"光标上移 + 逐行覆盖"方式：不清空旧区域，直接用新内容覆盖旧行，
+    避免"先清屏再绘制"产生的可见空白闪烁。
+    仅当新帧比旧帧短时，在末尾清掉残留行。
     """
+    prefix = ""
+    prev_rows = 0
     if prev_lines:
-        rows = _measure_rows(prev_lines)
-        prefix = f"\r\x1b[{rows}A\x1b[J"
-    else:
-        prefix = ""
+        prev_rows = _measure_rows(prev_lines)
+        prefix = f"\r\x1b[{prev_rows}A"
     text = _frame_text(lines)
+    new_rows = _measure_rows(lines)
+    if new_rows < prev_rows:
+        # 新帧更短：覆盖后清掉底部残留行
+        text = text + "\x1b[J"
+    # 每行末尾清到行尾，避免变短的行残留旧字符
+    text = text.replace("\n", "\x1b[K\n")
     try:
         console.file.write(prefix + text)
         console.file.flush()
@@ -189,7 +210,8 @@ def pick_option(options: List[str], title: str, default_index: int = 0,
                 filter_fn: Optional[Callable[[str], List[str]]] = None,
                 filter_meta: Optional[Callable[[str], None]] = None,
                 note_fn: Optional[Callable[[], str]] = None,
-                copy_text: Optional[Callable[[int], str]] = None) -> int:
+                copy_text: Optional[Callable[[int], str]] = None,
+                refresh_last: bool = False) -> int:
     """
     统一数字选择菜单。
     - 返回 -1 表示返回；0..total-1 为选项索引；total+i 为固定尾部选项 i
@@ -198,6 +220,7 @@ def pick_option(options: List[str], title: str, default_index: int = 0,
     - filterable: 允许输入非数字关键字过滤（需提供 filter_fn 重建选项列表）
     - copy_text: 输入 c<编号> 时调用，返回要复制的文本
     - Windows 交互式终端下支持 ↑/↓、j/k 键盘导航
+    - refresh_last: 首帧原地覆盖上一帧内容（用于同一菜单续驻，避免堆叠）
     """
     if not options:
         return -1
@@ -211,7 +234,7 @@ def pick_option(options: List[str], title: str, default_index: int = 0,
         return _keyboard_pick(
             options, title, default_index, allow_back, page_size, fixed_tail,
             non_selectable, hotkeys, filterable, filter_fn, filter_meta,
-            note_fn, copy_text,
+            note_fn, copy_text, refresh_last,
         )
 
     return _plain_pick(
@@ -360,7 +383,7 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                    non_selectable: Set[int], hotkeys: Dict[str, int],
                    filterable: bool, filter_fn: Optional[Callable],
                    filter_meta: Optional[Callable], note_fn: Optional[Callable],
-                   copy_text: Optional[Callable]) -> int:
+                   copy_text: Optional[Callable], refresh_last: bool = False) -> int:
     import msvcrt
 
     total_pages = max(1, (len(options) + page_size - 1) // page_size)
@@ -396,8 +419,12 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                         non_selectable, cursor=entries[cursor_pos])
         if number_buf:
             frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
-        _clear_and_redraw(frame, printed)
+        first_prev = []
+        if not printed and refresh_last:
+            first_prev = list(_LAST_FRAME)
+        _clear_and_redraw(frame, first_prev if not printed else printed)
         printed = list(frame)
+        _remember_frame(printed)
 
         key = _read_key(msvcrt)
 

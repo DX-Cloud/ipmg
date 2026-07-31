@@ -29,8 +29,10 @@ def _value_text(config: dict, key: str, value_type: type) -> str:
 
 def show_settings(config: dict) -> dict:
     """设置管理主界面，返回更新后的配置。"""
+    show_header(config)
+    last_idx = 0
+    resume = False  # 是否可在原地续驻上一帧（避免重绘闪烁与堆叠）
     while True:
-        show_header(config)
         options = [
             f"{label}: {_value_text(config, key, vtype)}"
             for key, label, vtype in SETTING_ITEMS
@@ -39,32 +41,35 @@ def show_settings(config: dict) -> dict:
         idx = widgets.pick_option(
             options,
             "设置 - 请选择要修改的项（0 返回）",
-            default_index=0,
+            default_index=last_idx,
             fixed_tail=["[?] 帮助说明"],
+            refresh_last=resume,
         )
         if idx < 0:
             return config
         if idx >= len(options):
             _show_help()
+            resume = False
             continue
 
         key, label, vtype = SETTING_ITEMS[idx]
         if vtype is bool:
             current = bool(cm.get_setting(config, key))
-            # 回车选中即切换，无需再次确认
+            # 回车选中即切换，无需再次确认；值变化直接反映在菜单文本上
             cm.set_setting(config, key, not current)
-            print(f"[OK] {label} 已切换为 {'关闭' if current else '开启'}")
+            resume = True
         else:
             current = str(cm.get_setting(config, key) or "")
             new_value = input(f"{label} [当前: {current or '空'}]（回车保持不变，输入 clear 清空）: ").strip()
             if new_value.lower() == "clear":
                 cm.set_setting(config, key, "")
-                print("[OK] 已清空")
             elif new_value:
                 cm.set_setting(config, key, new_value)
-                print("[OK] 已更新")
+            # 输入提示输出在菜单下方，下一帧改为从下方追加
+            resume = False
 
         cm.save_config(config)
+        last_idx = idx
 
 
 def _show_help():
