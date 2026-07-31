@@ -48,7 +48,11 @@ def show_settings(config: dict) -> dict:
         if idx < 0:
             return config
         if idx >= len(options):
+            # 整页刷新：清屏进入帮助页，返回后再整页刷新回设置菜单
+            show_header(config)
             _show_help()
+            show_header(config)
+            widgets.reset_last_frame()
             resume = False
             continue
 
