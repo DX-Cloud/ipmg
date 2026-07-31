@@ -105,9 +105,8 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
 
 
 def _print_lines(lines: Sequence[str]) -> None:
-    """逐行打印（普通输入模式）。"""
-    for line in lines:
-        console.print(line)
+    """一次性打印整帧（单次终端写入，避免逐行闪烁）。"""
+    console.print("\n".join(lines))
 
 
 def _line_cell_len(line: str) -> int:
@@ -134,16 +133,33 @@ def _measure_rows(lines: Sequence[str]) -> int:
     return rows
 
 
+def _frame_text(lines: Sequence[str]) -> str:
+    """将文本行渲染为终端输出文本（含 rich 样式码），不直接写入。"""
+    console.begin_capture()
+    try:
+        console.print("\n".join(lines))
+    finally:
+        capture = console.end_capture()
+    return str(capture)
+
+
 def _clear_and_redraw(lines: Sequence[str], prev_lines: Sequence[str]) -> None:
-    """键盘模式原地刷新：光标上移 prev 占用的行数并清空，然后重绘。"""
+    """
+    键盘模式原地刷新。
+    将"光标上移 + 清空旧区域 + 整个新帧"合并为一次终端写入，
+    避免清屏与重绘之间存在可见空白导致闪烁。
+    """
     if prev_lines:
         rows = _measure_rows(prev_lines)
-        try:
-            console.file.write(f"\r\x1b[{rows}A\x1b[J")
-            console.file.flush()
-        except Exception:
-            pass
-    _print_lines(lines)
+        prefix = f"\r\x1b[{rows}A\x1b[J"
+    else:
+        prefix = ""
+    text = _frame_text(lines)
+    try:
+        console.file.write(prefix + text)
+        console.file.flush()
+    except Exception:
+        pass
 
 
 def _page_nav(choice: str, current_page: int, total_pages: int) -> Optional[int]:
