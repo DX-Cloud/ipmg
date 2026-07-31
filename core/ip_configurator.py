@@ -10,6 +10,23 @@ from typing import Optional, Dict, Any
 # WMI 连接缓存
 _wmi_conn = None
 
+# WMI 网卡配置常见返回码及解决建议
+WMI_ERROR_HINTS = {
+    1: "操作不受当前网卡支持，请更换网卡或检查驱动",
+    84: "网卡当前未连接（断开状态），请接入网线后重试",
+    85: "IP 地址或子网掩码格式无效，请检查输入",
+    87: "无法将 IP 地址设置到该网卡，可能是地址无效或未被系统接受",
+    91: "DHCP 设置失败，请检查网卡状态",
+    97: "IP 地址已被其他网卡或主机占用，请更换地址",
+    99: "网关地址无效或不在同一网段",
+}
+
+
+def _wmi_error_text(action: str, code: int) -> str:
+    """生成带解决建议的错误提示。"""
+    hint = WMI_ERROR_HINTS.get(code, "请检查网卡连接状态与 IP 配置后重试")
+    return f"{action} 返回错误码: {code}\n建议: {hint}"
+
 
 def _get_wmi():
     """获取WMI连接（缓存复用）"""
@@ -50,7 +67,7 @@ def set_static_ip(adapter_name: str, ip: str, mask: str, gateway: str = None) ->
         # 设置静态IP
         ret_val = config.EnableStatic(IPAddress=[ip], SubnetMask=[mask])
         if ret_val[0] != 0:
-            return False
+            raise RuntimeError(_wmi_error_text("设置静态IP", ret_val[0]))
 
         # 设置网关
         if gateway:
@@ -85,7 +102,7 @@ def set_dhcp(adapter_name: str) -> bool:
             "请将网卡接入网线后重试。"
         )
 
-    raise RuntimeError(f"EnableDHCP 返回错误码: {code}")
+    raise RuntimeError(_wmi_error_text("恢复DHCP", code))
 
 
 def get_current_ip_config(adapter_name: str) -> Optional[Dict[str, Any]]:

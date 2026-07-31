@@ -37,10 +37,26 @@ DEVICE_REQUIRED = ["name", "device_ip", "subnet_mask"]
 # 历史记录最大数量
 MAX_HISTORY_RECORDS = 10
 
+# 配置文件 schema 版本（用于未来的平滑迁移）
+CONFIG_VERSION = 1
+
+# 用户设置默认值（集中管理交互偏好，避免散落硬编码）
+SETTINGS_DEFAULTS = {
+    "auto_open_page": False,             # 配置成功后自动打开设备管理页
+    "filter_virtual_adapters": True,     # 网卡列表默认过滤虚拟网卡
+    "confirm_danger_default_no": True,   # 危险操作（删除/覆盖）默认拒绝
+    "last_action": "configure",          # 主菜单记忆上次执行的动作
+    "hooks": {
+        "after_configure": "",           # 配置成功后执行的命令（钩子）
+        "after_restore": "",             # 恢复成功后执行的命令（钩子）
+    },
+}
+
 
 def _get_default_config() -> dict:
     """获取默认配置结构"""
     return {
+        "version": CONFIG_VERSION,
         "devices": [],
         "network_adapters": {
             "last_selected_mac": "",
@@ -48,6 +64,7 @@ def _get_default_config() -> dict:
         "backups": {},
         "ip_history": {},
         "groups": [],  # 预定义分组列表
+        "settings": copy.deepcopy(SETTINGS_DEFAULTS),
     }
 
 
@@ -93,9 +110,16 @@ def load_config(config_path: str = None) -> dict:
             config["backups"] = {}
         if "ip_history" not in config:
             config["ip_history"] = {}
+        if "version" not in config or not isinstance(config.get("version"), int):
+            config["version"] = 0
 
-        # 迁移旧版备份格式
-        config = _migrate_backup_format(config)
+        # 版本化迁移框架
+        config = _migrate_config(config)
+
+        # 规范化设置（合并缺失项）
+        if "settings" not in config or not isinstance(config.get("settings"), dict):
+            config["settings"] = {}
+        config["settings"] = _normalize_settings(config["settings"])
 
         # 规范化每个设备配置（跳过非字典项，避免手工编辑导致的启动崩溃）
         config["devices"] = [
@@ -114,6 +138,66 @@ def load_config(config_path: str = None) -> dict:
         config = _get_default_config()
         save_config(config, path)
         return config
+
+
+def _migrate_config(config: dict) -> dict:
+    """
+    按 version 字段逐版本迁移配置。
+    无 version 的旧配置视为 v0，走全部历史迁移。
+    """
+    version = config.get("version", 0)
+
+    # 旧版备份格式迁移（所有版本都需要）
+    config = _migrate_backup_format(config)
+
+    if version < 1:
+        # v0 -> v1：引入 settings 段（结构兼容，无破坏性变更）
+        if "settings" not in config or not isinstance(config.get("settings"), dict):
+            config["settings"] = {}
+        config["version"] = 1
+
+    return config
+
+
+def _normalize_settings(settings: dict) -> dict:
+    """合并默认设置，补充缺失项并保留用户已配置项。"""
+    merged = copy.deepcopy(SETTINGS_DEFAULTS)
+    if not isinstance(settings, dict):
+        return merged
+    for key, value in settings.items():
+        if key in merged:
+            if isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key].update({k: v for k, v in value.items() if k in merged[key]})
+            else:
+                merged[key] = value
+    return merged
+
+
+def get_setting(config: dict, key: str, default=None):
+    """读取设置项，支持点号路径（如 hooks.after_configure）。"""
+    if key.startswith("settings."):
+        key = key[len("settings."):]
+    settings = config.get("settings", {})
+    current = settings
+    for part in key.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return default if default is not None else SETTINGS_DEFAULTS.get(key)
+    return current
+
+
+def set_setting(config: dict, key: str, value) -> dict:
+    """写入设置项，支持点号路径。"""
+    if key.startswith("settings."):
+        key = key[len("settings."):]
+    settings = config.setdefault("settings", {})
+    parts = key.split(".")
+    current = settings
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+    current[parts[-1]] = value
+    return config
 
 
 def _migrate_backup_format(config: dict) -> dict:
