@@ -62,9 +62,8 @@ def main():
 
     # 导入模块（延迟导入，加快启动感知速度）
     from core.config_manager import load_config, save_config
-    from ui.app import show_main_menu, run_configure_flow, run_restore_flow
-    from ui.app import run_export_import_flow
-    from ui.device_manager import show_device_manager
+    from ui.app import show_main_menu
+    from ui.actions import find_action
     from utils.logger import log_info
 
     log_info("程序启动")
@@ -77,20 +76,29 @@ def main():
         try:
             action = show_main_menu(config)
 
-            if action == "configure":
-                config = run_configure_flow(config)
-            elif action == "restore":
-                config = run_restore_flow(config)
-            elif action == "manage":
-                config = show_device_manager(config)
-                save_config(config)
-            elif action == "export":
-                config = run_export_import_flow(config, "export")
-            elif action == "import":
-                config = run_export_import_flow(config, "import")
-            elif action == "exit":
+            if action == "exit":
                 log_info("程序退出")
                 break
+
+            # 记忆上次动作（主菜单下次默认高亮）
+            try:
+                from core.config_manager import set_setting
+                set_setting(config, "settings.last_action", action)
+            except Exception:
+                pass
+
+            entry = find_action(action)
+            if entry is None:
+                continue
+            config = entry.handler(config)
+            if entry.needs_save:
+                try:
+                    save_config(config)
+                except Exception as e:
+                    from utils.logger import log_error
+                    log_error("保存配置", str(e))
+                    print(f"\n发生错误: {e}")
+                    input("按回车键继续...")
 
         except KeyboardInterrupt:
             print("\n\n已退出")

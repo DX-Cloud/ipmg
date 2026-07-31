@@ -14,109 +14,10 @@ from core.config_manager import (
 from core.network_utils import (
     calculate_adapter_ip_auto, validate_ip, validate_subnet_mask
 )
+from ui import widgets
 from ui.header import show_header
 
 console = Console()
-
-
-def _pick_option(options: list, title: str, default_index: int = 0,
-                 allow_back: bool = True, page_size: int = 9,
-                 fixed_tail: list = None, non_selectable: set = None) -> int:
-    """
-    自定义数字选择菜单，支持自动分页和固定尾部选项。
-    non_selectable: 不可选中的选项索引集合（如分组标题），选中时提示错误。
-    返回 -1 表示返回，>=0 表示选项索引。
-    """
-    if not options:
-        return -1
-
-    non_selectable = non_selectable or set()
-    fixed_tail = fixed_tail or []
-    total = len(options)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    current_page = 0
-
-    while True:
-        start = current_page * page_size
-        end = min(start + page_size, total)
-        page_items = options[start:end]
-        fixed_base = min(start + page_size, total)
-
-        console.print(f"\n[bold cyan]{title}[/bold cyan]")
-        console.print("-" * 55)
-        for i, opt in enumerate(page_items):
-            num = start + i + 1
-            global_idx = start + i
-            if global_idx in non_selectable:
-                console.print(f"     {opt}")
-            else:
-                marker = " > " if global_idx == default_index else "   "
-                console.print(f"{marker}{num}. {opt}")
-
-        # 分页导航（在固定选项前）
-        if total_pages > 1:
-            bottom_options = []
-            if current_page > 0:
-                bottom_options.append("↑ 上一页")
-            if current_page < total_pages - 1:
-                bottom_options.append("↓ 下一页")
-            nav_prompt = f" (第{current_page + 1}/{total_pages}页)"
-            console.print(f"  [dim]{' | '.join(bottom_options)}{nav_prompt}[/dim]")
-
-        # 固定尾部选项（按当前页末尾编号显示，返回总偏移索引）
-        for i, ft in enumerate(fixed_tail):
-            display_num = fixed_base + i + 1
-            console.print(f"  {display_num}. {ft}")
-
-        if allow_back:
-            console.print(f"   0. <-- 返回上一页")
-        console.print("-" * 55)
-
-        try:
-            prompt = f"请输入序号 (1-{max(total, fixed_base + len(fixed_tail))}"
-            if allow_back:
-                prompt += ", 0=返回"
-            if total_pages > 1:
-                prompt += ", n/p 翻页"
-            prompt += "): "
-            choice = input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            return -1
-
-        if not choice:
-            return default_index if default_index < total else 0
-
-        if allow_back and choice == "0":
-            return -1
-
-        # 翻页
-        if total_pages > 1:
-            if choice.lower() in ("n", "next", ">", "."):
-                if current_page < total_pages - 1:
-                    current_page += 1
-                continue
-            if choice.lower() in ("p", "prev", "<", ","):
-                if current_page > 0:
-                    current_page -= 1
-                continue
-
-        try:
-            idx = int(choice) - 1
-            if idx in non_selectable:
-                console.print("[red]请选择设备，不能选择分组标题[/red]")
-                continue
-            if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
-                return total + (idx - fixed_base)
-            if 0 <= idx < total:
-                return idx
-            hint = f"1-{max(total, fixed_base + len(fixed_tail))}"
-            if allow_back:
-                hint += " 或 0 返回"
-            if total_pages > 1:
-                hint += ", n/p 翻页"
-            console.print(f"[red]无效输入，请输入 {hint}[/red]")
-        except ValueError:
-            console.print("[red]请输入数字[/red]")
 
 
 def show_device_manager(config: dict) -> dict:
@@ -159,10 +60,12 @@ def show_device_manager(config: dict) -> dict:
 
         # 默认索引指向第一个可选项（分组标题不可选）
         first_selectable = 1 if by_group else 0
-        idx = _pick_option(options, "设备管理 - 请选择设备或操作",
-                           page_size=8, default_index=first_selectable,
-                           fixed_tail=["[+] 添加新设备"],
-                           non_selectable=non_selectable)
+        idx = widgets.pick_option(
+            options, "设备管理 - 请选择设备或操作",
+            page_size=8, default_index=first_selectable,
+            fixed_tail=["[+] 添加新设备"],
+            non_selectable=non_selectable,
+        )
         if idx < 0:
             return config
 
@@ -196,7 +99,7 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
         f"{'[*] 取消收藏' if device.get('favorite') else '[*] 设为收藏'}",
     ]
 
-    idx = _pick_option(
+    idx = widgets.pick_option(
         options,
         f"设备: {device['name']} ({device['device_ip']}) - 请选择操作"
     )
@@ -212,8 +115,7 @@ def _device_action_menu(config: dict, device_idx: int) -> dict:
             input("\n按回车键继续...")
 
     elif idx == 1:
-        confirm = input(f"确认删除设备 '{device['name']}'？(y/N): ").strip().lower()
-        if confirm == "y":
+        if widgets.confirm(f"确认删除设备 '{device['name']}'?", default=False):
             delete_device(config, device_idx)
             save_config(config)
             console.print("[green][OK] 设备已删除[/green]")
@@ -250,7 +152,7 @@ def _set_device_group_ui(config: dict, device_idx: int) -> dict:
             "选择已有分组",
             "新建分组",
         ]
-        mode_idx = _pick_option(mode_options, "请选择操作")
+        mode_idx = widgets.pick_option(mode_options, "请选择操作")
         if mode_idx < 0:
             return config
 
@@ -269,7 +171,7 @@ def _set_device_group_ui(config: dict, device_idx: int) -> dict:
                 input("\n按回车键继续...")
                 continue
 
-            g_idx = _pick_option(group_options, "请选择分组", page_size=8)
+            g_idx = widgets.pick_option(group_options, "请选择分组", page_size=8)
             if g_idx < 0:
                 continue
 
@@ -290,8 +192,7 @@ def _set_device_group_ui(config: dict, device_idx: int) -> dict:
                 console.print("[red]分组名称不能为空[/red]")
                 continue
 
-            confirm = input(f"确认将设备 '{device['name']}' 加入分组 '{new_group}'？(Y/n): ").strip().lower()
-            if confirm == "n":
+            if not widgets.confirm(f"确认将设备 '{device['name']}' 加入分组 '{new_group}'?", default=True):
                 continue
 
             device["group"] = new_group
@@ -339,7 +240,7 @@ def _add_device_ui(config: dict) -> dict:
             "自动计算（取网段最后可用IP）",
             "手动指定网卡IP",
         ]
-        mode_idx = _pick_option(ip_mode_options, "选择网卡IP策略")
+        mode_idx = widgets.pick_option(ip_mode_options, "选择网卡IP策略")
         if mode_idx < 0:
             return None
 
@@ -384,8 +285,7 @@ def _add_device_ui(config: dict) -> dict:
         console.print()
         _display_device_summary(device)
 
-        confirm = input("\n确认保存？(Y/n): ").strip().lower()
-        if confirm == "n":
+        if not widgets.confirm("确认保存?", default=True):
             return None
 
         add_device(config, device)
@@ -437,7 +337,7 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
             f"自动计算（当前: {current_mode}）",
             "手动指定网卡IP",
         ]
-        mode_idx = _pick_option(
+        mode_idx = widgets.pick_option(
             ip_mode_options,
             f"选择网卡IP策略 (当前: {current_mode})"
         )
@@ -486,8 +386,7 @@ def _edit_device_ui(config: dict, device_idx: int) -> dict:
         console.print()
         _display_device_summary(device)
 
-        confirm = input("\n确认保存修改？(Y/n): ").strip().lower()
-        if confirm == "n":
+        if not widgets.confirm("确认保存修改?", default=True):
             return None
 
         update_device(config, device_idx, device)

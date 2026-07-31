@@ -1,200 +1,67 @@
 """
 主TUI界面
-构建主界面交互流程，串联所有模块
-使用自定义数字选择菜单
+构建主界面交互流程，串联所有模块。
+交互组件统一使用 ui.widgets，动作入口统一使用 ui.actions 注册表，
+核心业务步骤统一使用 core.operations（与展示解耦）。
 """
 
 import os
 import time
+
 from rich.console import Console
-from rich.table import Table
 
 from core.adapter_manager import get_network_adapters, select_adapter
+from core import config_manager as cm
+from core import operations
 from core.config_manager import (
-    load_config, save_config, get_devices, set_last_adapter_mac,
-    get_last_adapter_mac, export_config, import_config, get_adapter_backup,
-    get_ip_history, get_adapter_backup_stack, pop_adapter_backup
+    get_devices, get_last_adapter_mac, get_ip_history, get_adapter_backup_stack,
+    export_config, import_config,
 )
-from core.network_utils import resolve_adapter_ip, resolve_management_url, ping_host
-from core.ip_configurator import set_static_ip, set_dhcp, get_current_ip_config
-from core.browser_launcher import open_management_page, open_url
-from utils.backup import backup_adapter_config
+from core.network_utils import resolve_adapter_ip, resolve_management_url
+from core.browser_launcher import open_management_page
 from utils.logger import log_operation, log_error
+from ui import widgets, status
+from ui.actions import Action, register
 from ui.device_manager import show_device_manager
 from ui.header import show_header
+from ui.settings import show_settings
 
 console = Console()
 
 
-def _pick_option(options: list, title: str, default_index: int = 0,
-                 allow_back: bool = True, page_size: int = 9,
-                 fixed_tail: list = None, non_selectable: set = None) -> int:
+# ============== 设备选择 ==============
+
+def _build_device_menu(config: dict, keyword: str = ""):
     """
-    自定义数字选择菜单，支持自动分页和固定尾部选项。
-    non_selectable: 不可选中的选项索引集合（如分组标题）。
-    返回 -1 表示返回，>=0 表示选项索引。
+    构建设备选择菜单（分组展示 + 关键字过滤）。
+    返回 (options, index_map, non_selectable, first_selectable)。
+    index_map: 选项索引 -> 设备 dict。
     """
-    if not options:
-        return -1
+    devices = get_devices(config)
+    if keyword:
+        k = keyword.lower()
+        devices = [
+            d for d in devices
+            if k in d.get("name", "").lower()
+            or k in d.get("device_ip", "").lower()
+            or k in d.get("group", "").lower()
+        ]
 
-    non_selectable = non_selectable or set()
-    fixed_tail = fixed_tail or []
-    total = len(options)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    current_page = 0
-
-    while True:
-        start = current_page * page_size
-        end = min(start + page_size, total)
-        page_items = options[start:end]
-        fixed_base = min(start + page_size, total)
-
-        console.print(f"\n[bold cyan]{title}[/bold cyan]")
-        console.print("-" * 55)
-        for i, opt in enumerate(page_items):
-            num = start + i + 1
-            global_idx = start + i
-            if global_idx in non_selectable:
-                console.print(f"     {opt}")
-            else:
-                marker = " > " if global_idx == default_index else "   "
-                console.print(f"{marker}{num}. {opt}")
-
-        # 分页导航
-        if total_pages > 1:
-            bottom_options = []
-            if current_page > 0:
-                bottom_options.append("↑ 上一页")
-            if current_page < total_pages - 1:
-                bottom_options.append("↓ 下一页")
-            nav_prompt = f" (第{current_page + 1}/{total_pages}页)"
-            console.print(f"  [dim]{' | '.join(bottom_options)}{nav_prompt}[/dim]")
-
-        # 固定尾部选项（按当前页末尾编号显示，返回总偏移索引）
-        for i, ft in enumerate(fixed_tail):
-            display_num = fixed_base + i + 1
-            console.print(f"  {display_num}. {ft}")
-
-        if allow_back:
-            console.print(f"   0. <-- 返回上一页")
-        console.print("-" * 55)
-
-        max_valid = max(total, fixed_base + len(fixed_tail))
-        try:
-            prompt = f"请输入序号 (1-{max_valid}"
-            if allow_back:
-                prompt += ", 0=返回"
-            if total_pages > 1:
-                prompt += ", n/p 翻页"
-            prompt += "): "
-            choice = input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            return -1
-
-        if not choice:
-            return default_index if default_index < total else 0
-
-        if allow_back and choice == "0":
-            return -1
-
-        # 翻页
-        if total_pages > 1:
-            if choice.lower() in ("n", "next", ">", "."):
-                if current_page < total_pages - 1:
-                    current_page += 1
-                continue
-            if choice.lower() in ("p", "prev", "<", ","):
-                if current_page > 0:
-                    current_page -= 1
-                continue
-
-        try:
-            idx = int(choice) - 1
-            if idx in non_selectable:
-                console.print("[red]该项不可选择[/red]")
-                continue
-            # 固定尾部选项：按位置映射回 total 偏移返回
-            if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
-                return total + (idx - fixed_base)
-            if 0 <= idx < total:
-                return idx
-            hint = f"1-{max_valid}"
-            if allow_back:
-                hint += " 或 0 返回"
-            if total_pages > 1:
-                hint += ", n/p 翻页"
-            console.print(f"[red]无效输入，请输入 {hint}[/red]")
-        except ValueError:
-            console.print("[red]请输入数字[/red]")
-def _search_devices(devices: list, keyword: str) -> list:
-    """
-    搜索设备列表，支持名称和IP模糊匹配。
-    不区分大小写，部分匹配即可。
-    返回匹配的设备列表。
-    """
-    if not keyword:
-        return devices
-
-    keyword_lower = keyword.lower()
-    matched = []
-
+    by_group = {}
     for d in devices:
-        name = d.get("name", "").lower()
-        device_ip = d.get("device_ip", "").lower()
+        by_group.setdefault(d.get("group", ""), []).append(d)
+    groups = sorted(g for g in by_group if g) + ([""] if "" in by_group else [])
 
-        # 搜索设备名称或设备IP
-        if keyword_lower in name or keyword_lower in device_ip:
-            matched.append(d)
-
-    return matched
-
-
-def _build_device_options(devices: list) -> list:
-    """构建设备选项显示列表（扁平列表，无分组）"""
-    device_options = []
-    for d in devices:
-        fav = "*" if d.get("favorite") else " "
-        try:
-            adapter_ip = resolve_adapter_ip(d)
-            ip_preview = f"-> 网卡IP: {adapter_ip}"
-        except Exception:
-            ip_preview = "-> 网卡IP: 计算失败"
-
-        mgmt_url = resolve_management_url(d)
-        url_status = " [Web]" if mgmt_url else ""
-
-        device_options.append(
-            f"[{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}"
-        )
-    return device_options
-
-
-def _pick_grouped_device(config: dict, title: str) -> tuple:
-    """
-    按分组显示设备列表供用户选择。
-    返回 (selected_device, selected_device_index_in_config)，返回 None 表示取消。
-    """
-    from core.config_manager import get_devices_by_group, get_device_groups
-    by_group = get_devices_by_group(config)
-    groups = get_device_groups(config)
-    all_devices = get_devices(config)
-
-    if not all_devices:
-        return (None, -1)
-
-    # 先打印分组标题，再只把设备项交给 _pick_option
-    console.print(f"\n[bold cyan]{title}[/bold cyan]")
-    console.print("-" * 55)
-
-    pick_options = []
+    options = []
     index_map = {}
-    pick_idx = 0
-
+    non_selectable = set()
+    opt = 0
     for g in groups:
         label = f"── [{g}] ──" if g else "── [未分组] ──"
-        console.print(f"  [bold]{label}[/bold]")
-        devices = by_group.get(g, [])
-        for d in devices:
+        options.append(label)
+        non_selectable.add(opt)
+        opt += 1
+        for d in by_group[g]:
             fav = "*" if d.get("favorite") else " "
             try:
                 adapter_ip = resolve_adapter_ip(d)
@@ -203,244 +70,223 @@ def _pick_grouped_device(config: dict, title: str) -> tuple:
                 ip_preview = "-> 网卡IP: 计算失败"
             mgmt_url = resolve_management_url(d)
             url_status = " [Web]" if mgmt_url else ""
-            line = f"  [{fav}] {d['name']} | 设备: {d['device_ip']} | {ip_preview}{url_status}"
-            console.print(f"  {pick_idx + 1}. {line}")
-            pick_options.append(line)
-            for gi, gd in enumerate(all_devices):
-                if gd is d:
-                    index_map[pick_idx] = gi
-                    break
-            pick_idx += 1
+            options.append(
+                f"  [{fav}] {d.get('name', '')} | 设备: {d.get('device_ip', '')} | {ip_preview}{url_status}"
+            )
+            index_map[opt] = d
+            opt += 1
 
-    console.print("-" * 55)
-    console.print("  0. <-- 返回上一页")
-    console.print("-" * 55)
+    first = 1 if groups else 0
+    return options, index_map, non_selectable, first
 
-    # 让用户选择
+
+def _pick_device(config: dict, adapter) -> dict:
+    """
+    选择设备：分组展示，支持关键字即时过滤与 c<编号> 复制。
+    返回设备 dict，取消返回 None。
+    """
+    state = {"keyword": ""}
+
+    def refilter(keyword: str):
+        state["keyword"] = keyword
+        opts, imap, ns, first = _build_device_menu(config, keyword)
+        state["options"] = opts
+        state["index_map"], state["non_selectable"], state["first"] = imap, ns, first
+        return opts
+
+    def note():
+        return f"过滤: {state['keyword']}" if state["keyword"] else ""
+
+    def copy_fn(idx: int) -> str:
+        d = state.get("index_map", {}).get(idx)
+        if not d:
+            return ""
+        url = resolve_management_url(d)
+        text = f"{d.get('device_ip', '')}  {d.get('name', '')}"
+        return f"{text}  {url}" if url else text
+
+    refilter("")
     while True:
-        try:
-            prompt = f"请输入序号 (1-{len(pick_options)}, 0=返回): "
-            choice = input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            return (None, -1)
+        idx = widgets.pick_option(
+            state["options"],
+            f"已选网卡: {adapter.name} | 选择设备",
+            default_index=state["first"],
+            non_selectable=state["non_selectable"],
+            filterable=True,
+            filter_fn=refilter,
+            note_fn=note,
+            copy_text=copy_fn,
+        )
+        if idx < 0:
+            return None
+        if idx in state["index_map"]:
+            return state["index_map"][idx]
 
-        if not choice:
-            continue
-        if choice == "0":
-            return (None, -1)
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(pick_options):
-                if idx in index_map:
-                    return (all_devices[index_map[idx]], index_map[idx])
-                return (None, -1)
-            console.print(f"[red]无效输入，请输入 1-{len(pick_options)} 或 0 返回[/red]")
-        except ValueError:
-            console.print("[red]请输入数字[/red]")
 
+# ============== 主菜单 ==============
 
 def show_main_menu(config: dict = None) -> str:
-    """显示主菜单，返回用户选择"""
+    """显示主菜单（基于动作注册表），返回动作 key。"""
     show_header(config)
 
-    options = [
-        "配置IP - 选择网卡和设备，一键配置",
-        "恢复IP - 恢复网卡IP配置（含历史记录与撤销）",
-        "管理设备 - 添加/编辑/删除设备",
-        "导出配置",
-        "导入配置",
-        "退出",
-    ]
+    from ui.actions import get_actions
+    actions = get_actions()
+    options = [a.label for a in actions]
+    hotkeys = {a.hotkey.lower(): i for i, a in enumerate(actions) if a.hotkey}
 
-    idx = _pick_option(options, "请选择操作", allow_back=False)
-    actions = ["configure", "restore", "manage", "export", "import", "exit"]
+    default_idx = 0
+    if config:
+        last = cm.get_setting(config, "settings.last_action", "configure")
+        default_idx = next((i for i, a in enumerate(actions) if a.key == last), 0)
+
+    idx = widgets.pick_option(
+        options, "请选择操作", default_index=default_idx,
+        allow_back=False, hotkeys=hotkeys,
+    )
     if idx < 0:
         return "exit"
-    return actions[idx]
+    return actions[idx].key
+
+
+# ============== 配置IP流程 ==============
+
+def _maybe_jump_restore(config: dict) -> dict:
+    """配置失败后提供快捷入口直接进入恢复流程。"""
+    try:
+        again = input("按 r 进入恢复IP，按其他键返回主菜单: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return config
+    if again == "r":
+        return run_restore_flow(config)
+    return config
 
 
 def run_configure_flow(config: dict) -> dict:
-    """配置IP完整流程"""
+    """配置IP完整流程（选网卡 -> 选设备 -> 确认 -> 备份 -> 配置 -> 验证）。"""
     try:
         show_header(config)
 
-        # Step 1: 获取网卡列表
         console.print("\n[bold cyan]正在获取网卡列表...[/bold cyan]")
-        adapters = get_network_adapters()
-
+        filter_virtual = cm.get_setting(config, "settings.filter_virtual_adapters", True)
+        adapters = get_network_adapters(filter_virtual=filter_virtual)
         if not adapters:
             console.print("[red][X] 未检测到网卡[/red]")
             input("\n按回车键返回...")
             return config
 
-        # Step 2: 选择网卡
         last_mac = get_last_adapter_mac(config)
         default_idx = select_adapter(adapters, last_mac)
-
         adapter_options = []
         for i, a in enumerate(adapters):
-            status = "已连接" if a.is_up else "未连接"
+            state_str = "已连接" if a.is_up else "未连接"
             ip_str = f"IP: {a.display_ip}" if a.display_ip else "无IP"
             mark = " <-- 上次" if i == default_idx else ""
             adapter_options.append(
-                f"[{a.type_name}] {a.name} | {status} | {ip_str} | MAC: {a.mac}{mark}"
+                f"[{a.type_name}] {a.name} | {state_str} | {ip_str} | MAC: {a.mac}{mark}"
             )
 
-        adapter_idx = _pick_option(
+        adapter_idx = widgets.pick_option(
             adapter_options, "请选择网卡", default_index=default_idx
         )
         if adapter_idx < 0:
             return config
-
         selected_adapter = adapters[adapter_idx]
 
-        # Step 3: 获取设备列表
+        # 首次使用引导
         devices = get_devices(config)
         if not devices:
-            console.print("[yellow][!] 没有可用的设备配置，请先添加设备[/yellow]")
-            input("\n按回车键返回...")
-            return config
-
-        # Step 4: 选择设备（支持搜索，全部设备按分组展示）
-        while True:
-            mode_options = [
-                "显示全部设备（按分组）",
-                "搜索设备（输入关键词）",
-            ]
-            mode_idx = _pick_option(
-                mode_options,
-                f"已选网卡: {selected_adapter.name} | 请选择设备"
-            )
-            if mode_idx < 0:
+            console.print("[yellow][!] 没有可用的设备配置[/yellow]")
+            if widgets.confirm("是否现在添加第一个设备？", default=True):
+                config = show_device_manager(config)
+            devices = get_devices(config)
+            if not devices:
                 return config
 
-            if mode_idx == 0:
-                selected_device, _ = _pick_grouped_device(
-                    config,
-                    f"已选网卡: {selected_adapter.name} | 选择设备"
-                )
-                if selected_device is None:
-                    return config
-                break
-            else:
-                # 搜索设备
-                console.print("\n[cyan]请输入搜索关键词（支持设备名称、IP模糊匹配）:[/cyan]")
-                keyword = input("关键词: ").strip()
-                if not keyword:
-                    console.print("[yellow][!] 关键词为空，显示全部设备[/yellow]")
-                    display_devices = devices
-                else:
-                    display_devices = _search_devices(devices, keyword)
-                    if not display_devices:
-                        console.print(f"[yellow][!] 无匹配结果（关键词: {keyword}）[/yellow]")
-                        retry = input("按 1 重新搜索，按其他键返回: ").strip()
-                        if retry == "1":
-                            continue
-                        else:
-                            return config
-                    else:
-                        console.print(f"[green]搜索结果: {len(display_devices)} 条匹配[/green]")
+        selected_device = _pick_device(config, selected_adapter)
+        if selected_device is None:
+            return config
 
-                # 搜索结果是扁平列表
-                device_options = _build_device_options(display_devices)
-                device_idx = _pick_option(
-                    device_options,
-                    f"已选网卡: {selected_adapter.name} | 选择设备"
-                )
-                if device_idx < 0:
-                    continue
-                selected_device = display_devices[device_idx]
-                break
-
-        # Step 5: 解析网卡IP
         try:
-            adapter_ip = resolve_adapter_ip(selected_device)
+            plan = operations.build_configure_plan(selected_device)
         except ValueError as e:
             console.print(f"[red][X] 网卡IP计算失败: {e}[/red]")
             input("\n按回车键返回...")
             return config
 
-        # Step 6: 确认配置
-        mask = selected_device.get("subnet_mask", "255.255.255.0")
-        gateway = selected_device.get("gateway", "")
-
-        console.print("\n[bold]--- 配置确认 ---[/bold]")
-        console.print(f"  网卡:     {selected_adapter.name} ({selected_adapter.mac})")
-        console.print(f"  设备名称: {selected_device['name']}")
-        console.print(f"  设备IP:   {selected_device['device_ip']}")
-        console.print(f"  网卡将配置IP: [bold green]{adapter_ip}[/bold green]")
-        console.print(f"  子网掩码: {mask}")
-        if gateway:
-            console.print(f"  网关:     {gateway}")
-
-        confirm = input("\n确认执行配置？(Y/n): ").strip().lower()
-        if confirm == "n":
+        # 简化确认：信息已在列表行展示，仅高风险字段（网关/手动IP）补充显示
+        summary = (
+            f"网卡 {selected_adapter.name} -> {plan['adapter_ip']}/{plan['mask']}"
+            + (f"，网关 {plan['gateway']}" if plan.get("gateway") else "")
+            + f"（设备 {selected_device.get('name', '')} {selected_device.get('device_ip', '')}）"
+        )
+        if not widgets.confirm(f"确认配置: {summary}?", default=True):
             console.print("[yellow]已取消[/yellow]")
             return config
 
-        # Step 7: 备份当前网卡IP
         console.print("\n[bold cyan]正在备份网卡IP...[/bold cyan]")
-        backup_ok = backup_adapter_config(
-            selected_adapter.name, selected_adapter.mac, config
-        )
-        if backup_ok:
+        if operations.backup_current(config, selected_adapter):
             console.print("[green][OK] 网卡IP备份成功[/green]")
         else:
             console.print("[yellow][!] 网卡IP备份失败（继续执行）[/yellow]")
 
-        # Step 8: 执行IP配置
-        console.print(f"[bold cyan]正在配置网卡IP为 {adapter_ip}...[/bold cyan]")
+        console.print(f"[bold cyan]正在配置网卡IP为 {plan['adapter_ip']}...[/bold cyan]")
         try:
-            success = set_static_ip(
-                selected_adapter.name,
-                adapter_ip,
-                mask,
-                gateway if gateway else None,
-            )
-        except Exception as e:
+            success = operations.apply_static(selected_adapter.name, plan)
+        except RuntimeError as e:
             console.print(f"[red][X] IP配置失败: {e}[/red]")
-            log_operation("配置IP", selected_adapter.name, selected_device["name"], f"失败: {e}")
-            input("\n按回车键返回...")
-            return config
+            log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), f"失败: {e}")
+            return _maybe_jump_restore(config)
 
         if not success:
             console.print("[red][X] IP配置失败（WMI返回失败）[/red]")
-            log_operation("配置IP", selected_adapter.name, selected_device["name"], "失败: WMI返回失败")
-            input("\n按回车键返回...")
-            return config
+            log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), "失败: WMI返回失败")
+            return _maybe_jump_restore(config)
 
         console.print("[green][OK] IP配置成功[/green]")
-        log_operation("配置IP", selected_adapter.name, selected_device["name"], "成功")
+        log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), "成功")
 
-        # 保存配置（备份+MAC记忆）
-        set_last_adapter_mac(config, selected_adapter.mac)
         try:
-            save_config(config)
+            operations.save_state(config, selected_adapter.mac)
         except Exception as e:
             console.print(f"[yellow][!] 配置保存失败（不影响本次IP配置）: {e}[/yellow]")
 
-        # Step 9: Ping验证
-        console.print(f"\n[bold cyan]正在Ping设备 {selected_device['device_ip']} 验证连通性...[/bold cyan]")
+        console.print(f"\n[bold cyan]正在Ping设备 {selected_device.get('device_ip')} 验证连通性...[/bold cyan]")
         time.sleep(1)
-        if ping_host(selected_device["device_ip"], timeout=3):
-            console.print(f"[green][OK] 设备 {selected_device['device_ip']} 可达[/green]")
+        if operations.verify_device(selected_device.get("device_ip", ""), timeout=3):
+            console.print(f"[green][OK] 设备 {selected_device.get('device_ip')} 可达[/green]")
         else:
-            console.print(f"[yellow][!] 设备 {selected_device['device_ip']} 暂不可达（可能设备未开机或需要等待）[/yellow]")
+            console.print(
+                f"[yellow][!] 设备 {selected_device.get('device_ip')} 暂不可达"
+                "（可能设备未开机或需要等待）[/yellow]"
+            )
 
-        # Step 10: 提示打开管理页面
-        mgmt_url = resolve_management_url(selected_device)
+        operations.run_hooks(
+            config, "after_configure",
+            device=selected_device.get("name", ""),
+            adapter=selected_adapter.name,
+        )
+
+        mgmt_url = plan.get("mgmt_url")
         if mgmt_url:
-            console.print(f"\n[cyan]管理页面: {mgmt_url}[/cyan]")
-            open_now = input("按 1 打开管理页面，按其他键返回: ").strip()
-            if open_now == "1":
-                console.print("[cyan]正在打开浏览器...[/cyan]")
-                result = open_management_page(selected_device)
-                if result:
-                    console.print("[green][OK] 管理页面已打开[/green]")
+            if cm.get_setting(config, "settings.auto_open_page", False):
+                console.print(f"[cyan]管理页面: {mgmt_url}[/cyan]")
+                if open_management_page(selected_device):
+                    console.print("[green][OK] 已自动打开管理页面[/green]")
                 else:
                     console.print(f"[yellow][!] 浏览器打开失败，请手动访问: {mgmt_url}[/yellow]")
-                input("\n按回车键返回...")
+            else:
+                console.print(f"\n[cyan]管理页面: {mgmt_url}[/cyan]")
+                try:
+                    open_now = input("按 1 打开管理页面，按其他键返回: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    open_now = ""
+                if open_now == "1":
+                    if open_management_page(selected_device):
+                        console.print("[green][OK] 管理页面已打开[/green]")
+                    else:
+                        console.print(f"[yellow][!] 浏览器打开失败，请手动访问: {mgmt_url}[/yellow]")
 
+        status.set_last_result(f"[OK] 配置完成: {selected_adapter.name} -> {plan['adapter_ip']}")
         return config
 
     except Exception as e:
@@ -450,49 +296,51 @@ def run_configure_flow(config: dict) -> dict:
         input("\n按回车键返回...")
         return config
 
+
+# ============== 恢复IP流程 ==============
+
+def _adapter_options(adapters, default_idx: int) -> list:
+    options = []
+    for i, a in enumerate(adapters):
+        state_str = "已连接" if a.is_up else "未连接"
+        ip_str = f"IP: {a.display_ip}" if a.display_ip else "无IP"
+        mark = " <-- 上次" if i == default_idx else ""
+        options.append(
+            f"[{a.type_name}] {a.name} | {state_str} | {ip_str} | MAC: {a.mac}{mark}"
+        )
+    return options
+
+
 def run_restore_flow(config: dict) -> dict:
-    """恢复网卡IP流程 - 含历史记录 + 撤销栈"""
+    """恢复IP流程（DHCP + 多级撤销栈 + 历史记录）。"""
     try:
         show_header(config)
 
         console.print("\n[bold cyan]正在获取网卡列表...[/bold cyan]")
-        adapters = get_network_adapters()
-
+        filter_virtual = cm.get_setting(config, "settings.filter_virtual_adapters", True)
+        adapters = get_network_adapters(filter_virtual=filter_virtual)
         if not adapters:
             console.print("[red][X] 未检测到网卡[/red]")
             input("\n按回车键返回...")
             return config
 
-        # Step 1: 选择网卡
         last_mac = get_last_adapter_mac(config)
         default_idx = select_adapter(adapters, last_mac)
-
-        adapter_options = []
-        for i, a in enumerate(adapters):
-            status = "已连接" if a.is_up else "未连接"
-            ip_str = f"IP: {a.display_ip}" if a.display_ip else "无IP"
-            mark = " <-- 上次" if i == default_idx else ""
-            adapter_options.append(
-                f"[{a.type_name}] {a.name} | {status} | {ip_str} | MAC: {a.mac}{mark}"
-            )
-
-        adapter_idx = _pick_option(
-            adapter_options, "请选择要恢复IP的网卡", default_index=default_idx
+        adapter_idx = widgets.pick_option(
+            _adapter_options(adapters, default_idx),
+            "请选择要恢复IP的网卡",
+            default_index=default_idx,
         )
         if adapter_idx < 0:
             return config
-
         selected_adapter = adapters[adapter_idx]
 
-        # Step 2: 获取历史记录 + 撤销栈
         history = get_ip_history(config, selected_adapter.mac)
         backup_stack = get_adapter_backup_stack(config, selected_adapter.mac)
 
-        # 构建选项列表：DHCP + 撤销栈 + 历史记录
         options = ["恢复为 DHCP（自动获取）"]
-        option_sources = []  # 记录每条选项的来源和对应数据
+        option_sources = []
 
-        # 添加撤销栈条目
         if backup_stack:
             for bk in backup_stack:
                 ip = bk.get("ip", "")
@@ -504,7 +352,6 @@ def run_restore_flow(config: dict) -> dict:
                 options.append(f"[撤销] {mode}/{mask}{gw_str}  [{ts}]")
                 option_sources.append(("undo", bk))
 
-        # 添加历史记录条目
         if history:
             for record in history:
                 ip = record.get("ip", "")
@@ -518,22 +365,22 @@ def run_restore_flow(config: dict) -> dict:
         if not backup_stack and not history:
             console.print("\n[yellow][!] 该网卡暂无历史记录，仅可选择恢复为DHCP[/yellow]")
 
-        # 显示选择界面
         console.print(f"\n[bold cyan]已选网卡: {selected_adapter.name}[/bold cyan]")
-        idx = _pick_option(options, "请选择要恢复的IP配置")
-
+        # 默认高亮撤销栈顶（最近一次备份），一步恢复
+        default_restore_idx = 1 if backup_stack else 0
+        idx = widgets.pick_option(
+            options, "请选择要恢复的IP配置", default_index=default_restore_idx
+        )
         if idx < 0:
             return config
 
-        # Step 3: 执行恢复/撤销
         if idx == 0:
             return _do_restore_dhcp(config, selected_adapter)
 
-        source_type = option_sources[idx - 1][0]
+        source_type, source = option_sources[idx - 1]
         if source_type == "undo":
-            return _do_undo_restore(config, selected_adapter, option_sources[idx - 1][1])
-        else:
-            return _do_history_restore(config, selected_adapter, option_sources[idx - 1][1])
+            return _do_undo_restore(config, selected_adapter, source)
+        return _do_history_restore(config, selected_adapter, source)
 
     except Exception as e:
         log_error("恢复IP流程", str(e))
@@ -543,101 +390,47 @@ def run_restore_flow(config: dict) -> dict:
 
 
 def _do_restore_dhcp(config: dict, adapter) -> dict:
-    """执行DHCP恢复"""
+    """执行DHCP恢复。"""
     console.print(f"\n将恢复网卡 [cyan]{adapter.name}[/cyan] 为 DHCP 自动获取")
-    confirm = input("\n确认恢复？(Y/n): ").strip().lower()
-    if confirm == "n":
+    if not widgets.confirm("确认恢复?", default=True):
         return config
     try:
-        success = set_dhcp(adapter.name)
-        if success:
+        ok, message, config = operations.restore_to_dhcp(config, adapter)
+        if ok:
             console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
             log_operation("恢复IP", adapter.name, result="成功 -> DHCP")
+            operations.run_hooks(config, "after_restore", adapter=adapter.name)
+            status.set_last_result(f"[OK] 恢复完成: {adapter.name} -> DHCP")
         else:
-            console.print("[red][X] 恢复DHCP失败[/red]")
+            console.print(f"[red][X] {message}[/red]")
     except RuntimeError as e:
         console.print(f"[red][X] {e}[/red]")
-    save_config(config)
-    input("\n按回车键返回...")
     return config
 
 
 def _do_undo_restore(config: dict, adapter, backup: dict) -> dict:
-    """
-    执行撤销恢复（从备份栈弹出并应用）。
-    先定位目标备份并应用成功后再弹出；失败时备份栈保持不变，可重试。
-    非目标版本自动跳过，直到应用到选中版本。
-    """
+    """执行撤销恢复（先应用成功再弹出，失败保留备份栈）。"""
+    mode_label = "DHCP" if backup.get("is_dhcp") else f"静态IP: {backup.get('ip', '')}"
     console.print(f"\n[bold]--- 撤销确认 ---[/bold]")
     console.print(f"  网卡:     {adapter.name}")
-    mode_label = "DHCP" if backup.get("is_dhcp") else f"静态IP: {backup.get('ip', '')}"
     console.print(f"  恢复到:   {mode_label}")
-
-    confirm = input("\n确认执行撤销？(Y/n): ").strip().lower()
-    if confirm == "n":
+    if not widgets.confirm("确认执行撤销?", default=True):
         console.print("[yellow]已取消[/yellow]")
-        input("\n按回车键返回...")
         return config
 
-    # 在栈中定位目标备份（优先对象同一性，其次按内容匹配，避免依赖可变对象引用）
-    stack = get_adapter_backup_stack(config, adapter.mac)
-    target_pos = None
-    for i, bk in enumerate(stack):
-        if bk is backup or (
-            bk.get("ip") == backup.get("ip")
-            and bk.get("mask") == backup.get("mask")
-            and bk.get("gateway") == backup.get("gateway")
-            and bool(bk.get("is_dhcp")) == bool(backup.get("is_dhcp"))
-            and bk.get("timestamp") == backup.get("timestamp")
-        ):
-            target_pos = i
-            break
-
-    if target_pos is None:
-        console.print("[red][X] 备份栈中未找到该版本，可能已被其他操作清除[/red]")
-        input("\n按回车键返回...")
-        return config
-
-    target = stack[target_pos]
-
-    # 先应用目标版本，成功后再弹出（失败时栈保持不变）
-    try:
-        if target.get("is_dhcp", True):
-            result = set_dhcp(adapter.name)
-            if not result:
-                console.print("[red][X] 撤销DHCP失败[/red]")
-                input("\n按回车键返回...")
-                return config
-            console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
-        else:
-            result = set_static_ip(
-                adapter.name,
-                target.get("ip", ""),
-                target.get("mask", "255.255.255.0"),
-                target.get("gateway", "") or None,
-            )
-            if not result:
-                console.print("[red][X] 撤销静态IP失败[/red]")
-                input("\n按回车键返回...")
-                return config
-            console.print(f"[green][OK] 已恢复为静态IP: {target.get('ip', '')}[/green]")
-
-        # 应用成功：弹出目标及其之上的中间版本
-        for _ in range(target_pos + 1):
-            _, config = pop_adapter_backup(config, adapter.mac)
-        if target_pos > 0:
-            console.print(f"[dim]跳过 {target_pos} 级中间版本[/dim]")
-        log_operation("撤销IP", adapter.name, result=f"撤销到 {target.get('ip', 'DHCP')}")
-    except RuntimeError as e:
-        console.print(f"[red][X] 撤销失败: {e}[/red]")
-
-    save_config(config)
-    input("\n按回车键返回...")
+    ok, message, config = operations.undo_to_backup(config, adapter, backup)
+    if ok:
+        console.print(f"[green][OK] 已恢复为: {message}[/green]")
+        log_operation("撤销IP", adapter.name, result=f"撤销到 {message}")
+        operations.run_hooks(config, "after_restore", adapter=adapter.name)
+        status.set_last_result(f"[OK] 撤销完成: {adapter.name} -> {message}")
+    else:
+        console.print(f"[red][X] {message}[/red]")
     return config
 
 
 def _do_history_restore(config: dict, adapter, record: dict) -> dict:
-    """执行历史记录恢复"""
+    """执行历史记录恢复。"""
     ip = record.get("ip", "")
     mask = record.get("mask", "255.255.255.0")
     gateway = record.get("gateway", "")
@@ -646,28 +439,27 @@ def _do_history_restore(config: dict, adapter, record: dict) -> dict:
     console.print(f"  -> IP: {ip} / {mask}")
     if gateway:
         console.print(f"  -> 网关: {gateway}")
-
-    confirm = input("\n确认恢复？(Y/n): ").strip().lower()
-    if confirm == "n":
+    if not widgets.confirm("确认恢复?", default=True):
         return config
 
     try:
-        success = set_static_ip(adapter.name, ip, mask, gateway if gateway else None)
-        if success:
-            console.print(f"[green][OK] 已恢复为静态IP: {ip}[/green]")
-            log_operation("恢复IP", adapter.name, result=f"成功 -> {ip}")
+        ok, message, config = operations.history_restore(config, adapter, record)
+        if ok:
+            console.print(f"[green][OK] 已恢复为静态IP: {message}[/green]")
+            log_operation("恢复IP", adapter.name, result=f"成功 -> {message}")
+            operations.run_hooks(config, "after_restore", adapter=adapter.name)
+            status.set_last_result(f"[OK] 恢复完成: {adapter.name} -> {message}")
         else:
-            console.print("[red][X] 恢复静态IP失败[/red]")
+            console.print(f"[red][X] {message}[/red]")
     except RuntimeError as e:
         console.print(f"[red][X] {e}[/red]")
-
-    save_config(config)
-    input("\n按回车键返回...")
     return config
 
 
+# ============== 导入导出 ==============
+
 def run_export_import_flow(config: dict, mode: str) -> dict:
-    """配置导入导出流程"""
+    """配置导入导出流程。"""
     try:
         show_header(config)
 
@@ -676,25 +468,22 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
             if not path:
                 console.print("[yellow]已取消[/yellow]")
                 return config
-
             export_config(config, path)
             console.print(f"[green][OK] 配置已导出到: {path}[/green]")
             log_operation("导出配置", result=f"路径={path}")
-            input("\n按回车键返回...")
+            status.set_last_result("[OK] 配置已导出")
 
         elif mode == "import":
             path = input("导入路径 (如 D:\\config_backup.yaml): ").strip()
             if not path:
                 console.print("[yellow]已取消[/yellow]")
                 return config
-
             if not os.path.exists(path):
                 console.print(f"[red][X] 文件不存在: {path}[/red]")
                 input("\n按回车键返回...")
                 return config
 
-            confirm = input("导入将覆盖当前配置，确认？(y/N): ").strip().lower()
-            if confirm != "y":
+            if not widgets.confirm("导入将覆盖当前配置，确认?", default=False):
                 return config
 
             try:
@@ -703,10 +492,10 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
                 console.print(f"[red][X] 导入失败: {e}[/red]")
                 input("\n按回车键返回...")
                 return config
-            save_config(new_config)
+            cm.save_config(new_config)
             console.print("[green][OK] 配置导入成功[/green]")
             log_operation("导入配置", result=f"路径={path}")
-            input("\n按回车键返回...")
+            status.set_last_result("[OK] 配置导入成功")
             return new_config
 
     except Exception as e:
@@ -715,3 +504,14 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
         input("\n按回车键返回...")
 
     return config
+
+
+# ============== 动作注册（主菜单入口的唯一来源） ==============
+
+register(Action("configure", "配置IP - 选择网卡和设备，一键配置", run_configure_flow))
+register(Action("restore", "恢复IP - 恢复网卡IP配置（含历史记录与撤销）", run_restore_flow))
+register(Action("manage", "管理设备 - 添加/编辑/删除设备（支持分组）", show_device_manager, needs_save=True))
+register(Action("export", "导出配置", lambda c: run_export_import_flow(c, "export")))
+register(Action("import", "导入配置", lambda c: run_export_import_flow(c, "import")))
+register(Action("settings", "设置 - 交互偏好与钩子", show_settings, hotkey="s", needs_save=True))
+register(Action("exit", "退出", lambda c: c, hotkey="q"))
