@@ -4,10 +4,13 @@
 TUI 各页面共用，避免 _pick_option 在多处重复维护。
 """
 
+import math
+import shutil
 import sys
 from typing import Callable, Dict, List, Optional, Sequence, Set
 
 from rich.console import Console
+from rich.text import Text
 
 console = Console()
 
@@ -56,19 +59,20 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
             fixed_tail: Sequence[str], allow_back: bool,
             hotkeys: Optional[Dict[str, int]], note_fn: Optional[Callable[[], str]],
             non_selectable: Set[int], cursor: Optional[int] = None,
-            default_index: Optional[int] = None):
-    """渲染一页菜单。cursor 仅在键盘导航模式提供。"""
+            default_index: Optional[int] = None) -> List[str]:
+    """构建一页菜单的文本行（含 rich 标记）。cursor 仅在键盘导航模式提供。"""
+    lines: List[str] = [""]
     note = note_fn() if note_fn else ""
     title_line = f"{title}{('  [' + note + ']') if note else ''}"
-    console.print(f"\n[bold cyan]{title_line}[/bold cyan]")
-    console.print("-" * 55)
+    lines.append(f"[bold cyan]{title_line}[/bold cyan]")
+    lines.append("-" * 55)
 
     fixed_base = min(start + page_size, len(options))
     for i in range(start, end):
         opt = options[i]
         num = i + 1
         if i in non_selectable:
-            console.print(f"     {opt}")
+            lines.append(f"     {opt}")
             continue
         if cursor is not None:
             marker = " > " if i == cursor else "   "
@@ -76,7 +80,7 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
             marker = " > " if i == default_index else "   "
         else:
             marker = ""
-        console.print(f"{marker}{num}. {opt}")
+        lines.append(f"{marker}{num}. {opt}")
 
     if total_pages > 1:
         bottom = []
@@ -84,19 +88,62 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
             bottom.append("↑ 上一页(n)")
         if current_page < total_pages - 1:
             bottom.append("↓ 下一页(p)")
-        console.print(f"  [dim]{' | '.join(bottom)} (第{current_page + 1}/{total_pages}页)[/dim]")
+        lines.append(f"  [dim]{' | '.join(bottom)} (第{current_page + 1}/{total_pages}页)[/dim]")
 
     for i, ft in enumerate(fixed_tail):
-        console.print(f"  {fixed_base + i + 1}. {ft}")
+        lines.append(f"  {fixed_base + i + 1}. {ft}")
 
     if allow_back:
-        console.print("   0. <-- 返回")
+        lines.append("   0. <-- 返回")
     if hotkeys:
         keys = " ".join(f"{k}={hotkeys[k] + 1}" for k in sorted(hotkeys))
-        console.print(f"  [dim]快捷键: {keys}[/dim]")
+        lines.append(f"  [dim]快捷键: {keys}[/dim]")
     if cursor is not None:
-        console.print("  [dim]↑/↓ 或 j/k 移动, 回车确认, c 复制, f 过滤[/dim]")
-    console.print("-" * 55)
+        lines.append("  [dim]↑/↓ 或 j/k 移动, 回车确认, c 复制, f 过滤[/dim]")
+    lines.append("-" * 55)
+    return lines
+
+
+def _print_lines(lines: Sequence[str]) -> None:
+    """逐行打印（普通输入模式）。"""
+    for line in lines:
+        console.print(line)
+
+
+def _line_cell_len(line: str) -> int:
+    """计算一行文本在终端中的显示宽度（含中文字符）。"""
+    try:
+        return Text.from_markup(line).cell_len
+    except Exception:
+        return len(line)
+
+
+def _terminal_width() -> int:
+    try:
+        return shutil.get_terminal_size().columns or 80
+    except Exception:
+        return 80
+
+
+def _measure_rows(lines: Sequence[str]) -> int:
+    """估算一组文本行占用的终端行数（含自动换行）。"""
+    width = _terminal_width()
+    rows = 0
+    for line in lines:
+        rows += max(1, math.ceil(_line_cell_len(line) / width))
+    return rows
+
+
+def _clear_and_redraw(lines: Sequence[str], prev_lines: Sequence[str]) -> None:
+    """键盘模式原地刷新：光标上移 prev 占用的行数并清空，然后重绘。"""
+    if prev_lines:
+        rows = _measure_rows(prev_lines)
+        try:
+            console.file.write(f"\r\x1b[{rows}A\x1b[J")
+            console.file.flush()
+        except Exception:
+            pass
+    _print_lines(lines)
 
 
 def _page_nav(choice: str, current_page: int, total_pages: int) -> Optional[int]:
@@ -162,9 +209,9 @@ def _plain_pick(options: List[str], title: str, default_index: int,
         start = current_page * page_size
         end = min(start + page_size, len(options))
         fixed_base = min(start + page_size, len(options))
-        _render(title, options, start, end, page_size, current_page, total_pages,
-                fixed_tail, allow_back, hotkeys, note_fn, non_selectable,
-                default_index=default_index)
+        _print_lines(_render(title, options, start, end, page_size, current_page,
+                             total_pages, fixed_tail, allow_back, hotkeys, note_fn,
+                             non_selectable, default_index=default_index))
 
         max_valid = max(len(options), fixed_base + len(fixed_tail))
         prompt = f"请输入序号 (1-{max_valid}"
@@ -281,16 +328,18 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
     current_page = 0
     cursor = first_selectable(default_index if 0 <= default_index < len(options) else 0)
     number_buf = ""
+    printed: List[str] = []  # 当前屏幕上的全部文本行（用于原地刷新）
 
     while True:
         start = current_page * page_size
         end = min(start + page_size, len(options))
-        _render(title, options, start, end, page_size, current_page, total_pages,
-                fixed_tail, allow_back, hotkeys, note_fn, non_selectable,
-                cursor=cursor)
-
+        frame = _render(title, options, start, end, page_size, current_page,
+                        total_pages, fixed_tail, allow_back, hotkeys, note_fn,
+                        non_selectable, cursor=cursor)
         if number_buf:
-            console.print(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
+            frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
+        _clear_and_redraw(frame, printed)
+        printed = list(frame)
 
         key = _read_key(msvcrt)
 
@@ -329,17 +378,22 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                     current_page = cursor // page_size
         elif key == "enter":
             if number_buf and number_buf.isdigit():
-                idx = int(number_buf) - 1
+                entered = number_buf
+                idx = int(entered) - 1
                 number_buf = ""
                 if idx in non_selectable:
-                    console.print("[red]该项不可选择[/red]")
+                    msg = "[red]该项不可选择[/red]"
+                    _print_lines([msg])
+                    printed = printed + [msg]
                     continue
                 fixed_base = min(start + page_size, len(options))
                 if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
                     return len(options) + (idx - fixed_base)
                 if 0 <= idx < len(options):
                     return idx
-                console.print(f"[red]无效序号 {number_buf}[/red]")
+                msg = f"[red]无效序号 {entered}[/red]"
+                _print_lines([msg])
+                printed = printed + [msg]
                 continue
             if cursor not in non_selectable:
                 fixed_base = min(current_page * page_size + page_size, len(options))
@@ -359,11 +413,15 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
         elif key in ("c", "C") and copy_text:
             text = copy_text(cursor)
             if copy_to_clipboard(text):
-                console.print(f"[green][OK] 已复制: {text}[/green]")
+                msg = f"[green][OK] 已复制: {text}[/green]"
             else:
-                console.print(f"[yellow][!] 复制失败[/yellow]")
+                msg = "[yellow][!] 复制失败[/yellow]"
+            _print_lines([msg])
+            printed = printed + [msg]
         elif key in ("f", "F") and filterable and filter_fn:
-            console.print("[cyan]输入过滤关键字（回车确认，Esc 取消）:[/cyan]")
+            prompt_line = "[cyan]输入过滤关键字（回车确认，Esc 取消）:[/cyan]"
+            _print_lines([prompt_line])
+            printed = printed + [prompt_line]
             keyword = ""
             while True:
                 k = _read_key(msvcrt)
@@ -376,12 +434,16 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                     keyword = keyword[:-1]
                 elif len(k) == 1 and k.isprintable():
                     keyword += k
-                console.print(f"\r  [dim]关键字: {keyword}[/dim]", end="")
+                console.print(f"\r\x1b[2K  [dim]关键字: {keyword}[/dim]", end="")
+                console.file.flush()
             console.print()
+            printed += [f"  [dim]关键字: {keyword}[/dim]"]
             if keyword:
                 filtered = filter_fn(keyword)
                 if filtered is None or not filtered:
-                    console.print(f"[yellow][!] 无匹配结果（关键字: {keyword}）[/yellow]")
+                    msg = f"[yellow][!] 无匹配结果（关键字: {keyword}）[/yellow]"
+                    _print_lines([msg])
+                    printed = printed + [msg]
                 else:
                     options[:] = filtered
                     if filter_meta:
@@ -390,7 +452,9 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                     current_page = 0
                     cursor = first_selectable(0)
                     number_buf = ""
-                    console.print(f"[green]匹配 {len(options)} 条（关键字: {keyword}）[/green]")
+                    msg = f"[green]匹配 {len(options)} 条（关键字: {keyword}）[/green]"
+                    _print_lines([msg])
+                    printed = printed + [msg]
         elif key in hotkeys:
             return hotkeys[key]
         elif key.isdigit():
