@@ -51,8 +51,30 @@ def run_as_admin():
         return False
 
 
+def _enable_vt_console():
+    """
+    启用 Windows 控制台的 VT 转义序列处理。
+    必须在 rich Console 初始化之前调用，否则 rich 会判定为 legacy 模式，
+    导致自定义 ANSI 控制序列（光标移动/清屏）失效。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
 def main():
     """主入口"""
+    # 先启用 VT（必须在 rich Console 初始化前）
+    _enable_vt_console()
+
     # 管理员权限检测 - 自动提权
     if not is_admin():
         if not run_as_admin():

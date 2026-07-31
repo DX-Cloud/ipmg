@@ -311,11 +311,31 @@ def _plain_pick(options: List[str], title: str, default_index: int,
 
 
 def _keyboard_available() -> bool:
-    """键盘导航仅用于 Windows 交互式终端。"""
+    """
+    键盘导航仅用于 Windows 交互式终端，且要求 VT 转义序列可用
+    （原地刷新依赖 ANSI 光标移动/清屏，否则回退普通输入模式）。
+    """
     if sys.platform != "win32":
         return False
     try:
-        return bool(sys.stdin.isatty())
+        return bool(sys.stdin.isatty()) and _vt_enabled()
+    except Exception:
+        return False
+
+
+def _vt_enabled() -> bool:
+    """确认（并尝试启用）控制台 VT 处理。"""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if not (mode.value & 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        return bool(mode.value & 0x0004)
     except Exception:
         return False
 
