@@ -58,26 +58,33 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
             page_size: int, current_page: int, total_pages: int,
             fixed_tail: Sequence[str], allow_back: bool,
             hotkeys: Optional[Dict[str, int]], note_fn: Optional[Callable[[], str]],
-            non_selectable: Set[int], cursor: Optional[int] = None,
+            non_selectable: Set[int], cursor: Optional[tuple] = None,
             default_index: Optional[int] = None) -> List[str]:
-    """构建一页菜单的文本行（含 rich 标记）。cursor 仅在键盘导航模式提供。"""
+    """
+    构建一页菜单的文本行（含 rich 标记）。
+    cursor 仅在键盘导航模式提供，为 (type, payload)：
+      ("opt", 选项索引) / ("fixed", 固定尾部索引) / ("back", None)
+    """
     lines: List[str] = [""]
     note = note_fn() if note_fn else ""
     title_line = f"{title}{('  [' + note + ']') if note else ''}"
     lines.append(f"[bold cyan]{title_line}[/bold cyan]")
     lines.append("-" * 55)
 
+    cursor_type, cursor_payload = (cursor or (None, None))
     fixed_base = min(start + page_size, len(options))
     for i in range(start, end):
         opt = options[i]
         num = i + 1
         if i in non_selectable:
-            lines.append(f"     {opt}")
+            lines.append(f"   {opt}")
             continue
-        if cursor is not None:
-            marker = " > " if i == cursor else "   "
+        if cursor_type == "opt" and cursor_payload == i:
+            marker = " > "
         elif default_index is not None:
             marker = " > " if i == default_index else "   "
+        elif cursor_type is not None:
+            marker = "   "  # 键盘模式：非当前项保持占位对齐
         else:
             marker = ""
         lines.append(f"{marker}{num}. {opt}")
@@ -91,10 +98,12 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
         lines.append(f"  [dim]{' | '.join(bottom)} (第{current_page + 1}/{total_pages}页)[/dim]")
 
     for i, ft in enumerate(fixed_tail):
-        lines.append(f"  {fixed_base + i + 1}. {ft}")
+        marker = " > " if cursor_type == "fixed" and cursor_payload == i else "   "
+        lines.append(f"{marker}{fixed_base + i + 1}. {ft}")
 
     if allow_back:
-        lines.append("   0. <-- 返回")
+        marker = " > " if cursor_type == "back" else "   "
+        lines.append(f"{marker}0. <-- 返回")
     if hotkeys:
         keys = " ".join(f"{k}={hotkeys[k] + 1}" for k in sorted(hotkeys))
         lines.append(f"  [dim]快捷键: {keys}[/dim]")
@@ -334,24 +343,37 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                    copy_text: Optional[Callable]) -> int:
     import msvcrt
 
-    def first_selectable(from_idx: int) -> int:
-        idx = max(from_idx, 0)
-        while idx < len(options) and idx in non_selectable:
-            idx += 1
-        return idx
-
     total_pages = max(1, (len(options) + page_size - 1) // page_size)
     current_page = 0
-    cursor = first_selectable(default_index if 0 <= default_index < len(options) else 0)
+    cursor_pos = 0
     number_buf = ""
     printed: List[str] = []  # 当前屏幕上的全部文本行（用于原地刷新）
 
     while True:
         start = current_page * page_size
         end = min(start + page_size, len(options))
+        # 当前页可导航条目：本页选项 + 固定尾部 + 返回
+        entries: List[tuple] = [("opt", i) for i in range(start, end)]
+        entries += [("fixed", i) for i in range(len(fixed_tail))]
+        if allow_back:
+            entries.append(("back", None))
+
+        # 光标落在当前页第一个可选项上
+        if current_page == 0 and not printed:
+            target = default_index if 0 <= default_index < len(options) else 0
+            target = max(start, min(target, end - 1))
+            cursor_pos = target - start
+        if cursor_pos >= len(entries):
+            cursor_pos = max(0, len(entries) - 1)
+        while cursor_pos < len(entries) and entries[cursor_pos][0] == "opt" \
+                and entries[cursor_pos][1] in non_selectable:
+            cursor_pos += 1
+        if cursor_pos >= len(entries):
+            cursor_pos = 0
+
         frame = _render(title, options, start, end, page_size, current_page,
                         total_pages, fixed_tail, allow_back, hotkeys, note_fn,
-                        non_selectable, cursor=cursor)
+                        non_selectable, cursor=entries[cursor_pos])
         if number_buf:
             frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
         _clear_and_redraw(frame, printed)
@@ -359,39 +381,20 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
 
         key = _read_key(msvcrt)
 
-        if key == "up":
-            if cursor > 0:
-                candidate = cursor - 1
-                while candidate >= 0 and candidate in non_selectable:
-                    candidate -= 1
-                if candidate >= 0:
-                    cursor = candidate
-                    current_page = cursor // page_size
-        elif key == "down":
-            if cursor < len(options) - 1:
-                candidate = cursor + 1
-                while candidate < len(options) and candidate in non_selectable:
-                    candidate += 1
-                if candidate < len(options):
-                    cursor = candidate
-                    current_page = cursor // page_size
-        elif key in ("j", "J"):
-            # j 向下（vim 风格）
-            if cursor < len(options) - 1:
-                candidate = cursor + 1
-                while candidate < len(options) and candidate in non_selectable:
-                    candidate += 1
-                if candidate < len(options):
-                    cursor = candidate
-                    current_page = cursor // page_size
-        elif key in ("k", "K"):
-            if cursor > 0:
-                candidate = cursor - 1
-                while candidate >= 0 and candidate in non_selectable:
-                    candidate -= 1
-                if candidate >= 0:
-                    cursor = candidate
-                    current_page = cursor // page_size
+        if key in ("up", "k", "K"):
+            if cursor_pos > 0:
+                new = cursor_pos - 1
+                while new > 0 and entries[new][0] == "opt" \
+                        and entries[new][1] in non_selectable:
+                    new -= 1
+                cursor_pos = new
+        elif key in ("down", "j", "J"):
+            if cursor_pos < len(entries) - 1:
+                new = cursor_pos + 1
+                while new < len(entries) - 1 and entries[new][0] == "opt" \
+                        and entries[new][1] in non_selectable:
+                    new += 1
+                cursor_pos = new
         elif key == "enter":
             if number_buf and number_buf.isdigit():
                 entered = number_buf
@@ -411,23 +414,28 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                 _print_lines([msg])
                 printed = printed + [msg]
                 continue
-            if cursor not in non_selectable:
-                fixed_base = min(current_page * page_size + page_size, len(options))
-                if cursor >= fixed_base and cursor < fixed_base + len(fixed_tail):
-                    return len(options) + (cursor - fixed_base)
-                return cursor
+            etype, payload = entries[cursor_pos]
+            if etype == "back":
+                return -1
+            if etype == "fixed":
+                return len(options) + payload
+            return payload
         elif key == "escape" or (key == "0" and allow_back):
             return -1
         elif key in ("n", "N"):
             if current_page < total_pages - 1:
                 current_page += 1
+                cursor_pos = 0
         elif key in ("p", "P"):
             if current_page > 0:
                 current_page -= 1
+                cursor_pos = 0
         elif key == "backspace":
             number_buf = number_buf[:-1]
         elif key in ("c", "C") and copy_text:
-            text = copy_text(cursor)
+            etype, payload = entries[cursor_pos]
+            copy_idx = payload if etype == "opt" else 0
+            text = copy_text(copy_idx)
             if copy_to_clipboard(text):
                 msg = f"[green][OK] 已复制: {text}[/green]"
             else:
@@ -466,7 +474,7 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                         filter_meta(keyword)
                     total_pages = max(1, (len(options) + page_size - 1) // page_size)
                     current_page = 0
-                    cursor = first_selectable(0)
+                    cursor_pos = 0
                     number_buf = ""
                     msg = f"[green]匹配 {len(options)} 条（关键字: {keyword}）[/green]"
                     _print_lines([msg])
