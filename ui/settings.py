@@ -51,9 +51,9 @@ def show_settings(config: dict) -> dict:
         key, label, vtype = SETTING_ITEMS[idx]
         if vtype is bool:
             current = bool(cm.get_setting(config, key))
-            if widgets.confirm(f"{label}（当前: {'开启' if current else '关闭'}）切换为 {'关闭' if current else '开启'}?", default=False):
-                cm.set_setting(config, key, not current)
-                print("[OK] 已更新")
+            # 回车选中即切换，无需再次确认
+            cm.set_setting(config, key, not current)
+            print(f"[OK] {label} 已切换为 {'关闭' if current else '开启'}")
         else:
             current = str(cm.get_setting(config, key) or "")
             new_value = input(f"{label} [当前: {current or '空'}]（回车保持不变，输入 clear 清空）: ").strip()

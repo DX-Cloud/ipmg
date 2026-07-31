@@ -71,7 +71,7 @@ def _build_device_menu(config: dict, keyword: str = ""):
             mgmt_url = resolve_management_url(d)
             url_status = " [Web]" if mgmt_url else ""
             options.append(
-                f"  [{fav}] {d.get('name', '')} | 设备: {d.get('device_ip', '')} | {ip_preview}{url_status}"
+                f"[{fav}] {d.get('name', '')} | 设备: {d.get('device_ip', '')} | {ip_preview}{url_status}"
             )
             index_map[opt] = d
             opt += 1

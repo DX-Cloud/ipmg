@@ -46,7 +46,7 @@ def show_device_manager(config: dict) -> dict:
                     fav = "*" if d.get("favorite") else " "
                     ip_mode = "自动" if d.get("ip_mode") == "auto" else "手动"
                     group_tag = d.get("group", "")
-                    display = f"  [{fav}] {d['name']} | {d['device_ip']} | {ip_mode}"
+                    display = f"[{fav}] {d['name']} | {d['device_ip']} | {ip_mode}"
                     if group_tag:
                         display += f" | [{group_tag}]"
                     options.append(display)
