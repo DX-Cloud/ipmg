@@ -389,6 +389,8 @@ ipmg/
 ├── main.py                    # 程序入口
 ├── requirements.txt           # Python 依赖清单
 ├── .gitignore                 # Git 忽略规则
+├── LICENSE                    # MIT 开源许可
+├── ipmg.spec                  # PyInstaller 打包配置
 │
 ├── core/                      # 核心功能模块
 │   ├── __init__.py
@@ -396,13 +398,18 @@ ipmg/
 │   ├── config_manager.py      # 配置文件管理
 │   ├── ip_configurator.py     # IP 配置执行
 │   ├── network_utils.py       # 网络工具函数
-│   └── browser_launcher.py    # 浏览器启动
+│   ├── browser_launcher.py    # 浏览器启动
+│   └── operations.py          # 业务操作层（配置/恢复核心步骤）
 │
 ├── ui/                        # TUI 界面模块
 │   ├── __init__.py
 │   ├── app.py                 # 主界面与流程控制
+│   ├── actions.py             # 动作注册表（主菜单入口）
 │   ├── device_manager.py      # 设备管理界面
-│   └── header.py              # 固定标题栏
+│   ├── header.py              # 固定标题栏
+│   ├── settings.py            # 设置界面
+│   ├── status.py              # 跨页面状态（上次操作结果）
+│   └── widgets.py             # 统一交互组件（菜单/确认/剪贴板）
 │
 └── utils/                     # 工具模块
     ├── __init__.py
@@ -453,20 +460,47 @@ YAML 格式的配置文件管理：
 - 优先使用 `os.startfile()`
 - 失败时备选使用 `ctypes.windll.shell32.ShellExecuteW`
 
+### core/operations.py
+
+业务操作层，配置/恢复的核心步骤与 TUI 展示解耦（供界面、CLI、自动化测试复用）：
+- `build_configure_plan()` — 解析设备配置生成网卡配置计划
+- `apply_static()` / `restore_to_dhcp()` — 执行静态 IP / DHCP 切换
+- `undo_to_backup()` — 多级撤销（先应用成功再弹出备份，失败保留备份栈）
+- `run_hooks()` — 配置/恢复成功后执行用户自定义命令
+
 ### ui/app.py
 
 主 TUI 界面：
-- `_pick_option()` — 自定义数字选择菜单（支持分页、返回上一页、默认选项、不可选项、固定尾部选项）
-- `show_main_menu()` — 主菜单
+- `show_main_menu()` — 主菜单（基于动作注册表，记忆上次动作）
 - `run_configure_flow()` — 配置 IP 完整流程（支持分组浏览与设备搜索）
 - `run_restore_flow()` — 恢复 IP 流程（DHCP + 多级撤销栈 + 历史记录）
 - `run_export_import_flow()` — 导入导出流程
+
+### ui/widgets.py
+
+统一交互组件，所有页面共用：
+- `pick_option()` — 选择菜单（分页、关键字过滤、键盘导航、复制、不可选项、固定尾部）
+- `confirm()` — 统一确认对话框（危险操作默认拒绝）
+- `copy_to_clipboard()` — 复制文本到剪贴板
+
+### ui/actions.py
+
+动作注册表：主菜单、快捷键与 main 循环的单一数据来源，新增功能注册一条 Action 即可获得菜单入口。
+
+### ui/settings.py
+
+设置界面：自动打开管理页、虚拟网卡过滤、配置/恢复成功后执行命令（钩子），设置持久化到 `config.yaml` 的 `settings` 段。
+
+### ui/status.py
+
+跨页面轻量状态模块：保存"上次操作结果"，在标题栏展示，成功路径无需强制等待回车。
 
 ### ui/header.py
 
 固定标题栏模块：
 - 每次进入新页面时 `cls` 清屏 + 重绘标题栏
 - 实时显示当前选中网卡的 IP、掩码、网关、DHCP/静态状态
+- 网卡状态带 3 秒缓存，避免菜单切换卡顿
 
 ### utils/backup.py
 
