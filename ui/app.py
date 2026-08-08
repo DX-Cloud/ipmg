@@ -539,8 +539,10 @@ def run_check_update_flow(config: dict) -> dict:
         return config
 
     latest = result.get("version", "")
+    console.print(f"  GitHub 最新版本: [bold green]{latest}[/bold green]")
+    console.print(f"  本地版本:       [bold cyan]{APP_VERSION_DISPLAY}（{APP_VERSION}）[/bold cyan]")
     if update_check.is_newer(latest):
-        console.print(f"[green][OK] 发现新版本: {latest}（当前 {APP_VERSION_DISPLAY}）[/green]")
+        console.print("[green][OK] 发现新版本，可前往 Release 页面下载更新[/green]")
         body = (result.get("body") or "").strip()
         if body:
             console.print("[dim]更新说明摘要:[/dim]")
@@ -553,7 +555,7 @@ def run_check_update_flow(config: dict) -> dict:
             else:
                 console.print(f"[yellow][!] 打开失败，请手动访问: {release_url}[/yellow]")
     else:
-        console.print(f"[green][OK] 当前已是最新版本 {APP_VERSION_DISPLAY}[/green]")
+        console.print("[green][OK] 当前已是最新版本[/green]")
 
     input("\n按回车键返回...")
     return config
