@@ -68,8 +68,20 @@
 | **用户设置** | **设置菜单集中管理交互偏好（自动开页面、虚拟网卡过滤、动作钩子）** |
 | **虚拟网卡过滤** | **网卡列表默认隐藏 VMware/Hyper-V/WSL/蓝牙等虚拟网卡，可在设置中关闭** |
 | **动作钩子** | **配置/恢复成功后自动执行自定义命令，便于对接通知与自动化** |
+| **版本更新检测** | **启动时后台检测 GitHub（或镜像站）最新版本，标题栏提醒，可一键打开 Release 页面** |
+| **配置前预检** | **配置 IP 前检查 IP 冲突、网关网段、设备可达性，错误项阻止、警告项提示** |
+| **原子保存+自动备份** | **配置写入采用原子替换并保留上一版 .bak，异常时不损坏原配置** |
+| **配套配置编辑器** | **独立 GUI 工具（tkinter），可视化编辑本地配置文件** |
 
 ## 更新日志
+
+### v1.3
+
+- 版本更新检测：启动时后台检测 GitHub（或镜像站）最新版本，标题栏提醒；主菜单新增"检查更新"（快捷键 `u`），可打开 Release 页面；可在设置中关闭或指定镜像地址
+- 配置前预检：配置 IP 前检查本机 IP 冲突、ARP 冲突、网关网段、设备可达性，错误项阻止配置、警告项提示后继续
+- 配置原子保存与自动备份：写入改为临时文件 + 原子替换，并保留上一版 `config.yaml.bak`，异常时原配置不受影响
+- 配套配置可视化编辑器（GUI，tkinter）：独立程序 `ipmg-config-editor`，可打开/编辑/保存本地配置（设备、设置、网卡记忆、备份与历史），校验与主程序一致，损坏文件拒绝打开
+- 版本号集中管理（`core/version.py`），设置 schema（`SETTING_SCHEMA`）由 TUI 设置页与 GUI 编辑器共用
 
 ### v1.2
 
@@ -105,7 +117,7 @@
 
 ```
 ========================================
-     网络设备IP一键配置工具 v1.2
+     网络设备IP一键配置工具 v1.3
 ========================================
   当前网卡: 以太网 2 (08:26:AE:3B:68:20)
   IP 地址 : 192.168.1.100 / 255.255.255.0  [DHCP]  网关: 192.168.1.1
@@ -119,9 +131,10 @@
    4. 导出配置
    5. 导入配置
    6. 设置 - 交互偏好与钩子
-   7. 退出
+   7. 检查更新 - 检测GitHub最新版本
+   8. 退出
 -------------------------------------------------------
-请输入序号 (1-7), s=设置, q=退出:
+请输入序号 (1-8), s=设置, u=检查更新, q=退出:
 ```
 
 ### 配置流程
@@ -173,6 +186,9 @@
 2. 双击运行（会自动弹出 UAC 提权确认）
 3. 首次运行选择"管理设备"添加你的设备信息
 4. 之后选择"配置IP"即可一键切换
+
+> 配套的 `ipmg-config-editor.exe` 是配置可视化编辑器（GUI），可打开/编辑/保存
+> `%USERPROFILE%\ipmg\config.yaml`，适合批量维护设备与设置。
 
 ### 方式二：从源码运行
 
@@ -377,6 +393,9 @@ ip_history:
 settings:
   auto_open_page: false          # 配置成功后自动打开管理页面
   filter_virtual_adapters: true  # 网卡列表默认过滤虚拟网卡
+  update_check:
+    enabled: true                # 启动时自动检查更新
+    url: ""                      # 自定义检测地址（镜像），留空使用内置源
   hooks:
     after_configure: ""          # 配置成功后执行的命令（可选）
     after_restore: ""            # 恢复成功后执行的命令（可选）
@@ -390,7 +409,8 @@ ipmg/
 ├── requirements.txt           # Python 依赖清单
 ├── .gitignore                 # Git 忽略规则
 ├── LICENSE                    # MIT 开源许可
-├── ipmg.spec                  # PyInstaller 打包配置
+├── ipmg.spec                  # 主程序 PyInstaller 打包配置
+├── ipmg-editor.spec           # 配置编辑器打包配置
 │
 ├── core/                      # 核心功能模块
 │   ├── __init__.py
@@ -399,7 +419,10 @@ ipmg/
 │   ├── ip_configurator.py     # IP 配置执行
 │   ├── network_utils.py       # 网络工具函数
 │   ├── browser_launcher.py    # 浏览器启动
-│   └── operations.py          # 业务操作层（配置/恢复核心步骤）
+│   ├── operations.py          # 业务操作层（配置/恢复核心步骤）
+│   ├── preflight.py           # 配置前预检（IP冲突/网关/可达性）
+│   ├── update_check.py        # 版本更新检测
+│   └── version.py             # 版本号唯一来源
 │
 ├── ui/                        # TUI 界面模块
 │   ├── __init__.py
@@ -410,6 +433,15 @@ ipmg/
 │   ├── settings.py            # 设置界面
 │   ├── status.py              # 跨页面状态（上次操作结果）
 │   └── widgets.py             # 统一交互组件（菜单/确认/剪贴板）
+│
+├── editor/                    # 配置可视化编辑器（GUI, tkinter）
+│   ├── __init__.py
+│   ├── app.py                 # 主窗口
+│   ├── storage.py             # 配置读写（严格校验+原子保存）
+│   ├── device_page.py         # 设备管理页
+│   ├── settings_page.py       # 设置页
+│   ├── backup_page.py         # 备份与历史页
+│   └── __main__.py            # python -m editor 入口
 │
 └── utils/                     # 工具模块
     ├── __init__.py
@@ -468,6 +500,25 @@ YAML 格式的配置文件管理：
 - `undo_to_backup()` — 多级撤销（先应用成功再弹出备份，失败保留备份栈）
 - `run_hooks()` — 配置/恢复成功后执行用户自定义命令
 
+### core/preflight.py
+
+配置前预检，在切换 IP 前执行：
+- 本机其他网卡 IP 冲突（错误，阻止配置）
+- ARP 表冲突（警告，ARP 缓存可能过期）
+- 网关是否在掩码网段内（错误，阻止配置）
+- 目标设备可达性（警告）
+
+### core/update_check.py
+
+版本更新检测：
+- `parse_version()` / `is_newer()` — 版本号解析与比较
+- `check_latest()` — 从 GitHub API、源站重定向或镜像站按序获取最新版本
+- `UpdateChecker` — 后台线程检测，不阻塞 TUI
+
+### core/version.py
+
+版本信息唯一来源（`APP_VERSION` / `APP_VERSION_DISPLAY` / 检测源配置），标题栏与打包共用。
+
 ### ui/app.py
 
 主 TUI 界面：
@@ -513,6 +564,14 @@ YAML 格式的配置文件管理：
 Python logging 日志模块：
 - 日志文件按日期滚动
 - 自动创建日志目录
+
+### editor/（配套 GUI 编辑器）
+
+独立的配置可视化编辑器（tkinter，产物 `ipmg-config-editor.exe`）：
+- `storage.py` — 配置读写：打开前严格校验，损坏文件拒绝打开；保存复用主程序原子写入与备份
+- `device_page.py` — 设备表格与增删改表单，校验与主程序一致
+- `settings_page.py` — 按 `SETTING_SCHEMA` 生成设置表单（含网卡记忆）
+- `backup_page.py` — 备份栈与历史记录展示、清空
 
 ## 技术实现
 
@@ -564,14 +623,18 @@ if result <= 32:  # 用户取消 UAC 或提权失败
 # 安装 PyInstaller（需要 6.x，spec 使用 6.x 的 API）
 pip install "pyinstaller>=6.0"
 
-# 使用项目自带 spec 编译（含依赖排除与优化配置）
+# 主程序（含依赖排除与优化配置）
 python -m PyInstaller ipmg.spec --noconfirm --clean
 
-# 产物位于 dist\ipmg.exe，可复制到项目根目录直接运行
+# 配置可视化编辑器（GUI，窗口模式）
+python -m PyInstaller ipmg-editor.spec --noconfirm --clean
+
+# 产物位于 dist\，可复制到项目根目录直接运行
 Copy-Item dist\ipmg.exe .\ipmg.exe -Force
+Copy-Item dist\ipmg-config-editor.exe .\ipmg-config-editor.exe -Force
 ```
 
-编译产物约 15MB，首次启动约 3-5 秒（解压到临时目录）。
+主程序产物约 15MB，编辑器约 12MB；首次启动约 3-5 秒（解压到临时目录）。
 
 ## 注意事项
 
@@ -617,6 +680,7 @@ A: 支持。无线网卡也会在网卡列表中显示，但需要注意 WiFi �
 | [WMI](https://pypi.org/project/WMI/) | >=1.5.0 | Windows 管理规范接口（IP 配置操作） |
 | [pywin32](https://github.com/mhammond/pywin32) | >=306 | Windows API 调用支持 |
 | [netaddr](https://github.com/netaddr/netaddr) | >=0.9.0 | IP 地址计算（网段分析、可用 IP 计算） |
+| tkinter | 标准库 | 配置可视化编辑器 GUI |
 | [PyInstaller](https://pyinstaller.org/) | >=6.0 | 打包为单文件 exe（开发依赖） |
 
 ## License
