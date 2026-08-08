@@ -11,12 +11,11 @@ from ui import widgets
 from ui.header import show_header
 
 
-# (设置键, 显示名, 类型)  类型: bool -> 回车切换；str -> 输入新值
+# 设置项由 core.config_manager.SETTING_SCHEMA 统一提供（TUI 与 GUI 编辑器共用）
+# 类型: bool -> 回车切换；str -> 输入新值
 SETTING_ITEMS = [
-    ("settings.auto_open_page", "配置成功后自动打开管理页面", bool),
-    ("settings.filter_virtual_adapters", "网卡列表默认过滤虚拟网卡", bool),
-    ("settings.hooks.after_configure", "配置成功后执行命令（钩子）", str),
-    ("settings.hooks.after_restore", "恢复成功后执行命令（钩子）", str),
+    (f"settings.{key}", label, bool if vtype == "bool" else str)
+    for key, label, vtype in cm.SETTING_SCHEMA
 ]
 
 

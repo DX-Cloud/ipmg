@@ -13,12 +13,15 @@ from rich.console import Console
 from core.adapter_manager import get_network_adapters, select_adapter
 from core import config_manager as cm
 from core import operations
+from core import preflight
+from core import update_check
 from core.config_manager import (
     get_devices, get_last_adapter_mac, get_ip_history, get_adapter_backup_stack,
     export_config, import_config,
 )
 from core.network_utils import resolve_adapter_ip, resolve_management_url
-from core.browser_launcher import open_management_page
+from core.browser_launcher import open_management_page, open_url
+from core.version import APP_VERSION, APP_VERSION_DISPLAY, GITHUB_REPO
 from utils.logger import log_operation, log_error
 from ui import widgets, status
 from ui.actions import Action, register
@@ -212,6 +215,23 @@ def run_configure_flow(config: dict) -> dict:
             console.print(f"[red][X] 网卡IP计算失败: {e}[/red]")
             input("\n按回车键返回...")
             return config
+
+        # 配置前预检：错误阻止，警告提示后可继续
+        issues = preflight.run_preflight(adapters, selected_adapter, selected_device, plan)
+        if issues:
+            console.print("\n[bold]--- 配置预检 ---[/bold]")
+            for issue in issues:
+                if issue.level == "error":
+                    console.print(f"[red][X] {issue.message}[/red]")
+                else:
+                    console.print(f"[yellow][!] {issue.message}[/yellow]")
+                if issue.suggestion:
+                    console.print(f"  [dim]建议: {issue.suggestion}[/dim]")
+            errors = [i for i in issues if i.level == "error"]
+            if errors:
+                console.print("[red][X] 预检存在错误，已中止配置[/red]")
+                input("\n按回车键返回...")
+                return config
 
         # 简化确认：信息已在列表行展示，仅高风险字段（网关/手动IP）补充显示
         summary = (
@@ -506,6 +526,39 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
     return config
 
 
+# ============== 检查更新 ==============
+
+def run_check_update_flow(config: dict) -> dict:
+    """手动检查更新：检测最新版本并展示，可打开 Release 页面。"""
+    show_header(config)
+    console.print("[cyan]正在检查更新...[/cyan]")
+    result = update_check.check_latest()
+    if not result:
+        console.print("[yellow][!] 未获取到版本信息（网络不可达或检测源失效）[/yellow]")
+        input("\n按回车键返回...")
+        return config
+
+    latest = result.get("version", "")
+    if update_check.is_newer(latest):
+        console.print(f"[green][OK] 发现新版本: {latest}（当前 {APP_VERSION_DISPLAY}）[/green]")
+        body = (result.get("body") or "").strip()
+        if body:
+            console.print("[dim]更新说明摘要:[/dim]")
+            for line in body.splitlines()[:15]:
+                console.print(f"  [dim]{line}[/dim]")
+        release_url = f"https://github.com/{GITHUB_REPO}/releases/tag/{latest}"
+        if widgets.confirm("打开 Release 页面？", default=True):
+            if open_url(release_url):
+                console.print("[green][OK] 已打开 Release 页面[/green]")
+            else:
+                console.print(f"[yellow][!] 打开失败，请手动访问: {release_url}[/yellow]")
+    else:
+        console.print(f"[green][OK] 当前已是最新版本 {APP_VERSION_DISPLAY}[/green]")
+
+    input("\n按回车键返回...")
+    return config
+
+
 # ============== 动作注册（主菜单入口的唯一来源） ==============
 
 register(Action("configure", "配置IP - 选择网卡和设备，一键配置", run_configure_flow))
@@ -514,4 +567,5 @@ register(Action("manage", "管理设备 - 添加/编辑/删除设备（支持分
 register(Action("export", "导出配置", lambda c: run_export_import_flow(c, "export")))
 register(Action("import", "导入配置", lambda c: run_export_import_flow(c, "import")))
 register(Action("settings", "设置 - 交互偏好与钩子", show_settings, hotkey="s", needs_save=True))
+register(Action("check_update", "检查更新 - 检测GitHub最新版本", run_check_update_flow, hotkey="u"))
 register(Action("exit", "退出", lambda c: c, hotkey="q"))

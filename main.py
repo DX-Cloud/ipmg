@@ -93,6 +93,15 @@ def main():
     # 加载配置
     config = load_config()
 
+    # 后台版本检测（可配置，不阻塞主流程）
+    try:
+        from core.config_manager import get_setting
+        from core.update_check import default_checker
+        if get_setting(config, "settings.update_check.enabled", True):
+            default_checker.start()
+    except Exception:
+        pass
+
     # 主循环
     while True:
         try:

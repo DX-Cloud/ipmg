@@ -11,6 +11,7 @@ from rich.console import Console
 from core.adapter_manager import get_network_adapters, get_adapter_by_mac
 from core.ip_configurator import get_current_ip_config
 from core.config_manager import get_last_adapter_mac
+from core.version import APP_VERSION_DISPLAY
 
 console = Console()
 
@@ -41,7 +42,7 @@ def show_header(config: dict = None):
     os.system('cls')
 
     console.print("[bold]========================================[/bold]")
-    console.print("[bold]     网络设备IP一键配置工具 v1.2[/bold]")
+    console.print(f"[bold]     网络设备IP一键配置工具 {APP_VERSION_DISPLAY}[/bold]")
     console.print("[bold]========================================[/bold]")
 
     if config is not None:
@@ -74,6 +75,19 @@ def show_header(config: dict = None):
         last_result = status.get_last_result()
         if last_result:
             console.print(f"  {last_result}")
+    except Exception:
+        pass
+
+    # 新版本检测提示（后台线程结果，非阻塞）
+    try:
+        from core import update_check
+        result = update_check.default_checker.get_result()
+        if result:
+            latest = result.get("version", "")
+            if update_check.is_newer(latest):
+                console.print(
+                    f"  [yellow]发现新版本 {latest}（当前 {APP_VERSION_DISPLAY}），主菜单按 u 检查更新[/yellow]"
+                )
     except Exception:
         pass
 
