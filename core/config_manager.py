@@ -46,11 +46,26 @@ SETTINGS_DEFAULTS = {
     "filter_virtual_adapters": True,     # 网卡列表默认过滤虚拟网卡
     "confirm_danger_default_no": True,   # 危险操作（删除/覆盖）默认拒绝
     "last_action": "configure",          # 主菜单记忆上次执行的动作
+    "update_check": {
+        "enabled": True,                 # 启动时自动检查更新
+        "url": "",                       # 自定义检测地址（镜像站），空=内置源
+    },
     "hooks": {
         "after_configure": "",           # 配置成功后执行的命令（钩子）
         "after_restore": "",             # 恢复成功后执行的命令（钩子）
     },
 }
+
+# 设置项 schema（TUI 设置页与 GUI 编辑器共用，键为 settings 相对路径）
+SETTING_SCHEMA = [
+    ("auto_open_page", "配置成功后自动打开管理页面", "bool"),
+    ("filter_virtual_adapters", "网卡列表默认过滤虚拟网卡", "bool"),
+    ("confirm_danger_default_no", "危险操作默认拒绝（删除/覆盖）", "bool"),
+    ("update_check.enabled", "启动时自动检查更新", "bool"),
+    ("update_check.url", "自定义更新检测地址（镜像）", "str"),
+    ("hooks.after_configure", "配置成功后执行命令（钩子）", "str"),
+    ("hooks.after_restore", "恢复成功后执行命令（钩子）", "str"),
+]
 
 
 def _get_default_config() -> dict:
@@ -229,15 +244,25 @@ def _migrate_backup_format(config: dict) -> dict:
 def save_config(config: dict, config_path: str = None) -> None:
     """
     将配置写回YAML文件。
-    写入失败时抛出异常由调用方处理。
+    使用原子写入（临时文件 + os.replace），写前自动备份为 <path>.bak。
+    写入失败时抛出异常由调用方处理，原文件保持完好。
     """
     path = config_path or CONFIG_FILE
 
     # 确保目录存在
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
 
-    with open(path, "w", encoding="utf-8") as f:
+    # 写前备份上一版（保留最新一份）
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
+
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    os.replace(tmp_path, path)
 
 
 def get_devices(config: dict, group: str = None) -> list:

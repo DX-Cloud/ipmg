@@ -3,6 +3,7 @@
 build/
 *.spec
 !ipmg.spec
+!ipmg-editor.spec
 
 # 用户数据（配置已迁移到 %USERPROFILE%\ipmg\）
 config.yaml
