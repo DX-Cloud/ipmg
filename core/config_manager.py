@@ -54,6 +54,21 @@ SETTINGS_DEFAULTS = {
         "after_configure": "",           # 配置成功后执行的命令（钩子）
         "after_restore": "",             # 恢复成功后执行的命令（钩子）
     },
+    "resident": {
+        "enabled": False,                # 常驻后台（托盘 + 全局热键）
+        "close_to_tray": True,           # 关闭窗口时保留常驻而不是退出
+        "autostart": False,              # 开机自动启动（计划任务，创建时需管理员）
+    },
+    "hotkeys": {
+        "summon": "Ctrl+Alt+I",          # 唤出/收起窗口的全局热键，空=不注册
+    },
+    "notify": {
+        "balloon": True,                 # 操作结果用托盘气泡提示（常驻时）
+        "apply_requires_confirm": False,  # 快捷键应用配置前是否需要二次确认
+    },
+    "configure": {
+        "default_mode": "overwrite",     # 配置 IP 的默认模式：overwrite / append
+    },
 }
 
 # 设置项 schema（TUI 设置页与 GUI 编辑器共用，键为 settings 相对路径）
@@ -65,7 +80,64 @@ SETTING_SCHEMA = [
     ("update_check.url", "自定义更新检测地址（镜像）", "str"),
     ("hooks.after_configure", "配置成功后执行命令（钩子）", "str"),
     ("hooks.after_restore", "恢复成功后执行命令（钩子）", "str"),
+    ("resident.enabled", "常驻后台（托盘 + 全局热键）", "bool"),
+    ("resident.close_to_tray", "关闭窗口时保留常驻而不是退出", "bool"),
+    ("resident.autostart", "开机自动启动（计划任务，需管理员）", "bool"),
+    ("hotkeys.summon", "唤出/收起窗口的全局热键（如 Ctrl+Alt+I，空=不注册）", "str"),
+    ("notify.balloon", "操作结果用托盘气泡提示", "bool"),
+    ("notify.apply_requires_confirm", "快捷键应用配置前需要二次确认", "bool"),
+    ("configure.default_mode", "配置IP默认模式（overwrite=覆盖 / append=追加）", "str"),
 ]
+
+# 快捷预设：字段默认值与取值约束（列表属于"数据"，放在配置顶层而非 settings）
+PRESET_DEFAULTS = {
+    "name": "",              # 展示名
+    "enabled": False,        # 是否启用（启用前会做一次干跑校验）
+    "adapter_mac": "",       # 目标网卡 MAC（大写）
+    "device_name": "",       # 目标设备名（与 device_ip 至少匹配其一）
+    "device_ip": "",         # 目标设备 IP
+    "mode": "overwrite",     # overwrite / append
+    "hotkey": "",            # 绑定的全局热键，空=不绑定
+}
+
+PRESET_MODES = ("overwrite", "append")
+MAX_PRESETS = 20
+
+
+def _normalize_presets(presets) -> list:
+    """
+    规范化快捷预设列表：补默认字段、纠正类型、过滤非法项。
+    - mode 只允许 PRESET_MODES，非法值退回 overwrite
+    - MAC 统一大写、去除空白
+    - 至少要能定位到设备（device_name 或 device_ip 非空），否则丢弃该条
+    - 数量上限 MAX_PRESETS
+    """
+    if not isinstance(presets, list):
+        return []
+    result = []
+    for item in presets:
+        if not isinstance(item, dict):
+            continue
+        preset = copy.deepcopy(PRESET_DEFAULTS)
+        for key in PRESET_DEFAULTS:
+            if key in item:
+                preset[key] = item[key]
+
+        preset["name"] = str(preset["name"] or "").strip()
+        preset["device_name"] = str(preset["device_name"] or "").strip()
+        preset["device_ip"] = str(preset["device_ip"] or "").strip()
+        preset["adapter_mac"] = str(preset["adapter_mac"] or "").strip().upper()
+        preset["hotkey"] = str(preset["hotkey"] or "").strip()
+        preset["enabled"] = bool(preset["enabled"])
+        if preset["mode"] not in PRESET_MODES:
+            preset["mode"] = "overwrite"
+
+        if not preset["device_name"] and not preset["device_ip"]:
+            continue  # 定位不到设备的预设没有意义
+        result.append(preset)
+        if len(result) >= MAX_PRESETS:
+            break
+    return result
 
 
 def _get_default_config() -> dict:
@@ -79,6 +151,7 @@ def _get_default_config() -> dict:
         "backups": {},
         "ip_history": {},
         "groups": [],  # 预定义分组列表
+        "presets": [],  # 快捷预设（常驻热键应用配置用）
         "settings": copy.deepcopy(SETTINGS_DEFAULTS),
     }
 
@@ -136,6 +209,9 @@ def load_config(config_path: str = None) -> dict:
             config["settings"] = {}
         config["settings"] = _normalize_settings(config["settings"])
 
+        # 规范化快捷预设（顶层键：属于数据而非偏好，未知顶层键本来就会被保留）
+        config["presets"] = _normalize_presets(config.get("presets"))
+
         # 规范化每个设备配置（跳过非字典项，避免手工编辑导致的启动崩溃）
         config["devices"] = [
             _normalize_device(d) for d in config["devices"] if isinstance(d, dict)
@@ -175,7 +251,13 @@ def _migrate_config(config: dict) -> dict:
 
 
 def _normalize_settings(settings: dict) -> dict:
-    """合并默认设置，补充缺失项并保留用户已配置项。"""
+    """
+    合并默认设置，补充缺失项并保留用户已配置项。
+
+    前向兼容策略：**未知键原样保留**（顶层键与已知分组内的未知子键）。
+    旧版本不认识某个键时只是不显示、不使用，但不会再把它从配置里抹掉——
+    之前的行为是静默丢弃，任何一次保存都会永久丢失新版写入的设置。
+    """
     merged = copy.deepcopy(SETTINGS_DEFAULTS)
     if not isinstance(settings, dict):
         return merged
@@ -183,8 +265,14 @@ def _normalize_settings(settings: dict) -> dict:
         if key in merged:
             if isinstance(merged[key], dict) and isinstance(value, dict):
                 merged[key].update({k: v for k, v in value.items() if k in merged[key]})
+                # 分组内的未知子键同样保留
+                for sub_key, sub_value in value.items():
+                    merged[key].setdefault(sub_key, sub_value)
             else:
                 merged[key] = value
+        else:
+            # 未知顶层设置键：保留，避免"用旧版跑一次就丢新版的设置"
+            merged[key] = value
     return merged
 
 

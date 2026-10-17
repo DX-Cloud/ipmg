@@ -12,7 +12,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Set
 from rich.console import Console
 from rich.text import Text
 
+from ui import console as _console
+
 console = Console()
+
+# 键盘模式的按键轮询间隔（毫秒）：既要跟手，也要让后台事件（热键唤出/尺寸变化）及时生效
+KEY_POLL_MS = 200
 
 # 键盘模式上一帧内容（用于同一菜单续驻时首帧原地覆盖）
 _LAST_FRAME: List[str] = []
@@ -66,6 +71,40 @@ def confirm(prompt: str, default: bool = True) -> bool:
         if raw in ("n", "no"):
             return False
         console.print("[red]请输入 y 或 n[/red]")
+
+
+# 三选确认的返回值（用模块常量而不是枚举，调用方比较直观）
+CHOICE_OVERWRITE = "overwrite"
+CHOICE_CANCEL = "cancel"
+CHOICE_APPEND = "append"
+
+
+def confirm_three(prompt: str, default: str = CHOICE_OVERWRITE) -> str:
+    """
+    覆盖 / 取消 / 追加 三选确认。
+
+    返回 CHOICE_OVERWRITE、CHOICE_CANCEL 或 CHOICE_APPEND。
+    - 回车使用 default（默认覆盖）
+    - y/yes = 覆盖，n/no = 取消，a/append = 追加（大小写与首尾空格不敏感）
+    - 非法输入循环提示；EOF / Ctrl+C 视为取消（与 confirm() 的安全中止语义一致）
+    - 与 confirm() 完全独立，既有调用点不受影响
+    """
+    if default not in (CHOICE_OVERWRITE, CHOICE_CANCEL, CHOICE_APPEND):
+        default = CHOICE_OVERWRITE
+    while True:
+        try:
+            raw = input(f"{prompt} [Y]覆盖 / [n]取消 / [a]追加: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return CHOICE_CANCEL
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return CHOICE_OVERWRITE
+        if raw in ("n", "no"):
+            return CHOICE_CANCEL
+        if raw in ("a", "append"):
+            return CHOICE_APPEND
+        console.print("[red]请输入 y（覆盖）、n（取消）或 a（追加）[/red]")
 
 
 def _render(title: str, options: Sequence[str], start: int, end: int,
@@ -358,45 +397,33 @@ def _keyboard_available() -> bool:
     """
     键盘导航仅用于 Windows 交互式终端，且要求 VT 转义序列可用
     （原地刷新依赖 ANSI 光标移动/清屏，否则回退普通输入模式）。
+    实现已下沉到 ui/console.py，这里保留同名入口以兼容既有调用与测试。
     """
-    if sys.platform != "win32":
-        return False
-    try:
-        return bool(sys.stdin.isatty()) and _vt_enabled()
-    except Exception:
-        return False
+    return _console.keyboard_available()
 
 
 def _vt_enabled() -> bool:
-    """确认（并尝试启用）控制台 VT 处理。"""
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            return False
-        if not (mode.value & 0x0004):  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        return bool(mode.value & 0x0004)
-    except Exception:
-        return False
+    """确认（并尝试启用）控制台 VT 处理（下沉到 ui/console.py）。"""
+    return _console.vt_enabled()
 
 
 def _read_key(msvcrt) -> str:
-    """读取一个按键，方向键归一化为 up/down/left/right。"""
-    ch = msvcrt.getwch()
-    if ch in ("\x00", "\xe0"):
-        second = msvcrt.getwch()
-        return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(second, second)
-    if ch == "\r":
-        return "enter"
-    if ch == "\x1b":
-        return "escape"
-    if ch == "\x08":
-        return "backspace"
-    return ch
+    """读取一个按键，方向键归一化为 up/down/left/right（下沉到 ui/console.py）。"""
+    return _console.read_key(msvcrt)
+
+
+def _next_key() -> Optional[str]:
+    """
+    取下一个按键，但**可被打断**：
+    - 有按键 → 返回按键名
+    - 超时 / 后台线程调用 console.wake() / 终端尺寸变化 → 返回 None
+
+    返回 None 时调用方应处理待办事件并重绘当前帧。
+    测试注入按键时请 monkeypatch 本函数（而不是 _read_key）。
+    """
+    # force=True：是否进入键盘模式已在 pick_option → _keyboard_available() 判定过，
+    # 这里不要重复判定，否则测试打桩 _keyboard_available 会失效
+    return _console.wait_key(KEY_POLL_MS, force=True)
 
 
 def _keyboard_pick(options: List[str], title: str, default_index: int,
@@ -444,8 +471,13 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
         _clear_and_redraw(frame, first_prev if not printed else printed)
         printed = list(frame)
         _remember_frame(printed)
+        _console.reset_size_baseline()  # 记录本次绘制宽度，尺寸变化时才会触发重绘
 
-        key = _read_key(msvcrt)
+        key = _next_key()
+        if key is None:
+            # 超时 / 被后台线程唤醒（常驻态热键唤出等）/ 终端尺寸变化：
+            # 直接进入下一轮重绘，画面不会停留在隐藏前的旧帧或错位的旧宽度上
+            continue
 
         if key in ("up", "k", "K"):
             if cursor_pos > 0:
