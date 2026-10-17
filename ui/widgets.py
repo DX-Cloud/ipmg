@@ -439,6 +439,7 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
     cursor_pos = 0
     number_buf = ""
     printed: List[str] = []  # 当前屏幕上的全部文本行（用于原地刷新）
+    dirty = True             # 仅在需要时才重绘：常驻态隐藏窗口时空闲不重画
 
     while True:
         start = current_page * page_size
@@ -460,25 +461,30 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
             # 本页尾部全是不可选条目：退到本页最后一个可选条目（原实现会跳回页首）
             cursor_pos = _last_selectable(entries, non_selectable)
 
-        frame = _render(title, options, start, end, page_size, current_page,
-                        total_pages, fixed_tail, allow_back, hotkeys, note_fn,
-                        non_selectable, cursor=entries[cursor_pos])
-        if number_buf:
-            frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
-        first_prev = []
-        if not printed and refresh_last:
-            first_prev = list(_LAST_FRAME)
-        _clear_and_redraw(frame, first_prev if not printed else printed)
-        printed = list(frame)
-        _remember_frame(printed)
-        _console.reset_size_baseline()  # 记录本次绘制宽度，尺寸变化时才会触发重绘
+        if dirty:
+            frame = _render(title, options, start, end, page_size, current_page,
+                            total_pages, fixed_tail, allow_back, hotkeys, note_fn,
+                            non_selectable, cursor=entries[cursor_pos])
+            if number_buf:
+                frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
+            first_prev = []
+            if not printed and refresh_last:
+                first_prev = list(_LAST_FRAME)
+            _clear_and_redraw(frame, first_prev if not printed else printed)
+            printed = list(frame)
+            _remember_frame(printed)
+            _console.reset_size_baseline()  # 记录本次绘制宽度，尺寸变化时才会触发重绘
+            dirty = False
 
         key = _next_key()
         if key is None:
-            # 超时 / 被后台线程唤醒（常驻态热键唤出等）/ 终端尺寸变化：
-            # 直接进入下一轮重绘，画面不会停留在隐藏前的旧帧或错位的旧宽度上
+            # 空闲 / 被后台线程唤醒（常驻态热键唤出、后台结果、尺寸变化）：
+            # 只有确实有事件时才重绘，避免常驻隐藏时空转重画整帧
+            if _console.drain_events():
+                dirty = True
             continue
 
+        dirty = True
         if key in ("up", "k", "K"):
             if cursor_pos > 0:
                 new = cursor_pos - 1

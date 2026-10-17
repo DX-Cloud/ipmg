@@ -30,6 +30,7 @@ from typing import List, Optional
 EVENT_REDRAW = "redraw"        # 请求重绘当前帧
 EVENT_SUMMON = "summon"        # 请求把窗口带到前台
 EVENT_RESULT = "result"        # 后台操作有结果待汇报
+EVENT_RESIZE = "resize"        # 终端尺寸变化，需要重绘
 
 # 轮询间隔：20ms 足够跟手，又不会把 CPU 拉满
 POLL_INTERVAL_S = 0.02
@@ -150,6 +151,8 @@ def wait_key(timeout_ms: Optional[int] = None, force: bool = False) -> Optional[
       键盘模式，这里再判定一次会导致测试打桩失效，故由调用方决定。
 
     返回值要么是按键名（见模块说明），要么是 None（表示"没有按键，请检查事件与重绘"）。
+    尺寸变化时会先投递 EVENT_RESIZE 事件再返回 None，上层据此决定是否重绘——
+    这样空闲时（没有按键、没有事件）上层可以完全不重绘，避免常驻态下每 200ms 白画一帧。
     非 Windows / 非交互式终端且 ``force=False`` 时退化为阻塞 ``input()``（保持既有行为）。
     """
     if not force and not keyboard_available():
@@ -161,6 +164,7 @@ def wait_key(timeout_ms: Optional[int] = None, force: bool = False) -> Optional[
     import msvcrt
 
     if _size_changed():
+        post_event(EVENT_RESIZE)
         return None
 
     start = time.monotonic()
@@ -177,5 +181,6 @@ def wait_key(timeout_ms: Optional[int] = None, force: bool = False) -> Optional[
         if timeout_ms is not None and (time.monotonic() - start) * 1000.0 >= timeout_ms:
             return None
         if _size_changed():
+            post_event(EVENT_RESIZE)
             return None
         time.sleep(POLL_INTERVAL_S)

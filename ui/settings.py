@@ -26,9 +26,73 @@ def _value_text(config: dict, key: str, value_type: type) -> str:
     return str(value) if value else "（空）"
 
 
+# ---------------------------------------------------------------- 特殊设置项联动
+def _sync_autostart(config: dict) -> None:
+    """进入设置页时把"开机自启"的显示值同步为计划任务的真实状态。"""
+    from core import autostart
+    if not autostart.is_supported():
+        return
+    actual = autostart.task_exists()
+    if bool(cm.get_setting(config, "settings.resident.autostart", False)) != actual:
+        cm.set_setting(config, "settings.resident.autostart", actual)
+        cm.save_config(config)
+
+
+def _apply_autostart(config: dict, enable: bool) -> None:
+    """开关开机自启：真正创建/删除计划任务，失败则不写入设置（菜单仍显示真实状态）。"""
+    from core import autostart
+    if not autostart.is_supported():
+        print("[X] 当前系统不支持计划任务（schtasks 不可用），无法设置开机自启")
+        input("按回车键继续...")
+        return
+    ok, message = autostart.enable() if enable else autostart.disable()
+    if ok:
+        cm.set_setting(config, "settings.resident.autostart", enable)
+        print(f"[OK] {message}")
+    else:
+        print(f"[X] {'开启' if enable else '关闭'}开机自启失败: {message}")
+        print("    （创建/删除计划任务需要管理员权限，请以管理员身份运行）")
+    input("按回车键继续...")
+
+
+def _apply_resident_toggle(config: dict, enable: bool) -> None:
+    """常驻开关：立即启动/停止常驻控制器，而不是等下次运行才生效。"""
+    from ui import resident as resident_module
+    controller = resident_module.get_controller()
+    if enable:
+        if controller is not None:
+            cm.set_setting(config, "settings.resident.enabled", True)
+            return
+        new_controller = resident_module.ResidentController(config)
+        ok, message = new_controller.start()
+        print(f"[常驻] {message}")
+        if ok:
+            resident_module.set_controller(new_controller)
+            cm.set_setting(config, "settings.resident.enabled", True)
+        else:
+            cm.set_setting(config, "settings.resident.enabled", False)
+    else:
+        if controller is not None:
+            controller.stop()
+            resident_module.set_controller(None)
+        cm.set_setting(config, "settings.resident.enabled", False)
+    input("按回车键继续...")
+
+
+def _reload_hotkeys_if_resident() -> None:
+    """热键相关设置变化后，若正在常驻则立即重注册。"""
+    from ui import resident as resident_module
+    controller = resident_module.get_controller()
+    if controller is None:
+        return
+    for combo, err in controller.reload_hotkeys():
+        print(f"[!] 热键 {combo} 注册失败: {err}")
+
+
 def show_settings(config: dict) -> dict:
     """设置管理主界面，返回更新后的配置。"""
     show_header(config)
+    _sync_autostart(config)   # 开机自启的显示值以计划任务真实状态为准
     last_idx = 0
     resume = False  # 是否可在原地续驻上一帧（避免重绘闪烁与堆叠）
     while True:
@@ -57,17 +121,36 @@ def show_settings(config: dict) -> dict:
 
         key, label, vtype = SETTING_ITEMS[idx]
         if vtype is bool:
-            current = bool(cm.get_setting(config, key))
-            # 回车选中即切换，无需再次确认；值变化直接反映在菜单文本上
-            cm.set_setting(config, key, not current)
-            resume = True
+            new_value = not bool(cm.get_setting(config, key))
+            if key == "settings.resident.autostart":
+                # 真正创建/删除计划任务（失败不写设置），并打印结果
+                _apply_autostart(config, new_value)
+                resume = False
+            elif key == "settings.resident.enabled":
+                _apply_resident_toggle(config, new_value)
+                resume = False
+            else:
+                # 回车选中即切换，无需再次确认；值变化直接反映在菜单文本上
+                cm.set_setting(config, key, new_value)
+                resume = True
         else:
             current = str(cm.get_setting(config, key) or "")
+            if key == "settings.hotkeys.summon":
+                print("  提示: 组合键形如 Ctrl+Alt+I（至少一个修饰键 + 单个主键），留空表示不注册")
             new_value = input(f"{label} [当前: {current or '空'}]（回车保持不变，输入 clear 清空）: ").strip()
+            changed = False
             if new_value.lower() == "clear":
                 cm.set_setting(config, key, "")
+                changed = True
             elif new_value:
-                cm.set_setting(config, key, new_value)
+                from core.win32host import parse_hotkey
+                if key == "settings.hotkeys.summon" and parse_hotkey(new_value) is None:
+                    print(f"[X] 组合键 {new_value!r} 不合法（需要至少一个修饰键 + 单个主键），未修改")
+                else:
+                    cm.set_setting(config, key, new_value)
+                    changed = True
+            if changed and key.startswith("settings.hotkeys"):
+                _reload_hotkeys_if_resident()
             # 输入提示输出在菜单下方，下一帧改为从下方追加
             resume = False
 

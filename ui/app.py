@@ -591,9 +591,23 @@ def run_check_update_flow(config: dict) -> dict:
 
 # ============== 动作注册（主菜单入口的唯一来源） ==============
 
+def run_presets_flow(config: dict) -> dict:
+    """快捷预设管理页：常驻态下由全局热键一键应用的目标。"""
+    from ui.presets import show_presets
+    config = show_presets(config)
+    # 预设/热键可能变了：若正在常驻，立刻按新配置重新注册热键
+    from ui import resident as resident_module
+    controller = resident_module.get_controller()
+    if controller is not None:
+        for combo, err in controller.reload_hotkeys():
+            console.print(f"[yellow][!] 热键 {combo} 注册失败: {err}[/yellow]")
+    return config
+
+
 register(Action("configure", "配置IP - 选择网卡和设备，一键配置", run_configure_flow))
 register(Action("restore", "恢复IP - 恢复网卡IP配置（含历史记录与撤销）", run_restore_flow))
 register(Action("manage", "管理设备 - 添加/编辑/删除设备（支持分组）", show_device_manager, needs_save=True))
+register(Action("presets", "快捷预设 - 常驻热键一键应用配置", run_presets_flow, hotkey="p", needs_save=True))
 register(Action("export", "导出配置", lambda c: run_export_import_flow(c, "export")))
 register(Action("import", "导入配置", lambda c: run_export_import_flow(c, "import")))
 register(Action("settings", "设置 - 交互偏好与钩子", show_settings, hotkey="s", needs_save=True))

@@ -1,6 +1,7 @@
 # 编译产物
 *.exe
-build/
+build/*
+!build/make_icon.py
 *.spec
 !ipmg.spec
 !ipmg-editor.spec
