@@ -305,6 +305,46 @@ def _new_nid() -> NOTIFYICONDATAW:
     return nid
 
 
+# ------------------------------ 原生对话框 ------------------------------
+# 托盘气泡依赖系统通知设置，可能被"专注助手/通知关闭"静默抑制；
+# 需要"一定会被看到"的场合（二次确认、气泡不可用时的结果反馈）用原生对话框。
+
+MB_OK = 0x00000000
+MB_YESNO = 0x00000004
+MB_ICONQUESTION = 0x00000020
+MB_ICONINFORMATION = 0x00000040
+MB_ICONWARNING = 0x00000030
+MB_TOPMOST = 0x00040000
+MB_SETFOREGROUND = 0x00010000
+IDYES = 6
+
+
+def confirm_dialog(title: str, text: str) -> bool:
+    """
+    弹出原生"是/否"确认框，返回用户是否点了"是"。
+
+    可在任意线程调用（内部有独立的消息循环），因此适合在热键工作线程里
+    做"应用前二次确认"。任何异常都返回 False（安全侧：不确认就不动作）。
+    """
+    try:
+        flags = MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND
+        result = _user32.MessageBoxW(None, str(text)[:2000], str(title)[:200], flags)
+        return int(result) == IDYES
+    except Exception as exc:  # pragma: no cover - 防御
+        _log.warning("confirm_dialog 失败: %s", exc)
+        return False
+
+
+def info_dialog(title: str, text: str, warning: bool = False) -> None:
+    """弹出原生"确定"提示框（用于气泡不可用时的兜底反馈）。"""
+    try:
+        flags = MB_OK | MB_TOPMOST | MB_SETFOREGROUND
+        flags |= MB_ICONWARNING if warning else MB_ICONINFORMATION
+        _user32.MessageBoxW(None, str(text)[:2000], str(title)[:200], flags)
+    except Exception as exc:  # pragma: no cover - 防御
+        _log.warning("info_dialog 失败: %s", exc)
+
+
 # ============================== 事件线程宿主 ==============================
 
 

@@ -22,7 +22,7 @@ from core import operations
 from core.adapter_manager import get_network_adapters
 from core.config_manager import get_devices
 from core.opgate import gate
-from core.win32host import Win32Host, parse_hotkey
+from core.win32host import Win32Host, confirm_dialog, info_dialog, parse_hotkey
 from utils.logger import log_error, log_operation
 
 from ui import console as uconsole
@@ -67,6 +67,7 @@ class ResidentController:
         self.host: Optional[Win32Host] = None
         self.console_hidden = False
         self.hotkey_errors: List[Tuple[str, str]] = []   # [(组合键, 失败原因)]
+        self.skipped_hotkeys: List[Tuple[str, str]] = []  # [(预设名, 为何没注册)]
         self.last_message = ""
 
     # ------------------------------------------------------------------ 生命周期
@@ -118,6 +119,7 @@ class ResidentController:
     def _register_hotkeys(self) -> List[Tuple[str, str]]:
         """按当前配置注册热键，返回失败列表。"""
         errors: List[Tuple[str, str]] = []
+        self.skipped_hotkeys = []
         if self.host is None:
             return errors
 
@@ -130,7 +132,13 @@ class ResidentController:
         used = {summon.lower()} if summon else set()
         for index, preset in enumerate(self.config.get("presets") or []):
             combo = str(preset.get("hotkey") or "").strip()
-            if not preset.get("enabled") or not combo:
+            if not preset.get("enabled"):
+                # 绑了热键但没启用：不注册，但要在启动信息里说清楚，否则用户会以为热键坏了
+                if combo:
+                    self.skipped_hotkeys.append(
+                        (preset.get("name") or f"预设{index + 1}", "预设未启用"))
+                continue
+            if not combo:
                 continue
             if parse_hotkey(combo) is None:
                 errors.append((combo, "组合键格式不合法"))
@@ -236,6 +244,22 @@ class ResidentController:
         if gate.busy:
             return self._fail(gate.busy_reason)
 
+        # 应用前二次确认（设置项 notify.apply_requires_confirm）：
+        # 用原生对话框而不是托盘气泡/控制台提示——控制台可能处于隐藏状态，
+        # 气泡又可能被系统通知设置抑制，而改 IP 是有副作用的操作，必须让用户看到。
+        if bool(cm.get_setting(self.config, "settings.notify.apply_requires_confirm", False)):
+            device_text = preset.get("device_name") or preset.get("device_ip") or "（未指定）"
+            mode_text = "追加 IP（保留现有地址）" if preset.get("mode") == "append" else "覆盖 IP"
+            detail = (f"预设：{label}\n"
+                      f"网卡：{preset.get('adapter_mac') or '（未指定，将用第一块网卡）'}\n"
+                      f"设备：{device_text}\n"
+                      f"模式：{mode_text}\n\n"
+                      f"确定现在应用到网卡吗？")
+            if not confirm_dialog("ipmg - 确认应用配置", detail):
+                log_operation("热键应用", preset.get("adapter_mac", ""), device_text,
+                              "已取消（用户未确认）")
+                return False, f"{label}: 已取消"
+
         try:
             with gate.hold("热键应用", timeout=0):
                 return self._apply_locked(preset, label)
@@ -296,15 +320,25 @@ class ResidentController:
             status.set_last_result(text)
         except Exception:
             pass
-        self.notify("ipmg", text)
+        shown = self.notify("ipmg", text)
+
+        # 控制台隐藏时，气泡是唯一"看得见"的通道，但它受系统通知设置影响
+        # （专注助手/关闭通知会静默抑制）。因此：
+        #   - 用户开启了"应用前二次确认"（明确要交互式反馈）→ 一律补一个结果弹窗
+        #   - 否则只在气泡确实没发出去时兜底弹窗
+        interactive = bool(cm.get_setting(
+            self.config, "settings.notify.apply_requires_confirm", False))
+        if self.console_hidden and (interactive or not shown):
+            info_dialog("ipmg", text, warning=text.startswith("[X]"))
         uconsole.wake()
 
-    def notify(self, title: str, text: str) -> None:
+    def notify(self, title: str, text: str) -> bool:
+        """发托盘气泡，返回是否成功发出（供调用方决定要不要兜底）。"""
         if self.host is None:
-            return
+            return False
         if not bool(cm.get_setting(self.config, "settings.notify.balloon", True)):
-            return
+            return False
         try:
-            self.host.notify(title, text)
+            return bool(self.host.notify(title, text))
         except Exception:
-            pass
+            return False

@@ -151,6 +151,9 @@ def run_selfcheck() -> int:
             hotkey = str(preset.get("hotkey") or "").strip()
             if not hotkey:
                 continue
+            if not preset.get("enabled"):
+                print(f"预设热键 {hotkey:<12}: 跳过（该预设未启用，热键不会注册）")
+                continue
             ok, err = host.register_hotkey(200 + index, hotkey)
             print(f"预设热键 {hotkey:<12}: {'可用' if ok else '失败 - ' + err}")
             if not ok:
@@ -183,6 +186,64 @@ def run_selfcheck() -> int:
     print("自检全部通过")
     print("=" * 66)
     return 0
+
+
+def _ask_exit_resident(config: dict) -> str:
+    """
+    常驻状态下点"退出"时询问意图。
+    返回 "tray"（最小化到托盘继续常驻）/ "quit"（彻底退出）/ "cancel"（什么也不做）。
+    默认项由设置 settings.resident.close_to_tray 决定。
+    """
+    from core.config_manager import get_setting
+    from ui import widgets
+
+    close_to_tray = bool(get_setting(config, "settings.resident.close_to_tray", True))
+    options = [
+        "最小化到托盘（继续常驻，随时可用热键唤出）",
+        "完全退出（结束常驻，托盘图标消失）",
+    ]
+    idx = widgets.pick_option(
+        options,
+        "程序正在后台常驻，请选择退出方式",
+        default_index=0 if close_to_tray else 1,
+    )
+    if idx < 0:
+        return "cancel"
+    return "tray" if idx == 0 else "quit"
+
+
+# 控制台控制处理器必须保持引用，否则会被垃圾回收导致回调失效
+_CTRL_HANDLER = None
+
+
+def _install_console_close_handler(on_close) -> None:
+    """
+    注册控制台控制处理器：点窗口 X（CTRL_CLOSE_EVENT）、注销、关机时做清理。
+
+    注意：控制台程序**无法阻止**系统在收到 CTRL_CLOSE_EVENT 后结束进程，
+    这里只能保证离开时把托盘图标与热键干净地摘掉（避免残留"幽灵图标"）。
+    常驻模式下控制台默认是隐藏的，正常不会点到 X；要退出请在菜单里选"完全退出"。
+    """
+    global _CTRL_HANDLER
+    if sys.platform != "win32":
+        return
+    try:
+        handler_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+        ctrl_close, ctrl_logoff, ctrl_shutdown = 2, 5, 6
+
+        def _handler(event):
+            if event in (ctrl_close, ctrl_logoff, ctrl_shutdown):
+                try:
+                    on_close()
+                except Exception:
+                    pass
+                return True
+            return False
+
+        _CTRL_HANDLER = handler_type(_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER, True)
+    except Exception:
+        _CTRL_HANDLER = None
 
 
 def main() -> int:
@@ -223,8 +284,12 @@ def main() -> int:
 
     # 常驻：命令行参数优先，其次看设置
     resident_mode = flags["resident"] or bool(get_setting(config, "settings.resident.enabled", False))
+    resident_controller = None
     if resident_mode:
-        _start_resident(config, flags)
+        resident_controller = _start_resident(config, flags)
+        if resident_controller is not None:
+            # 点 X / 注销 / 关机时把托盘图标与热键摘干净，避免残留幽灵图标
+            _install_console_close_handler(_stop_resident)
 
     # 后台版本检测（可配置，不阻塞主流程）
     try:
@@ -240,6 +305,20 @@ def main() -> int:
             action = show_main_menu(config)
 
             if action == "exit":
+                # 常驻状态下"退出"默认是最小化到托盘，而不是结束进程
+                if resident_controller is not None and resident_controller.running:
+                    decision = _ask_exit_resident(config)
+                    if decision == "cancel":
+                        continue
+                    if decision == "tray":
+                        if resident_controller.hide_console():
+                            print("[常驻] 已最小化到托盘，程序继续在后台运行（热键或托盘图标可唤出）。")
+                        else:
+                            print("[常驻] 当前终端无法隐藏窗口，程序仍在后台常驻；"
+                                  "再次选择退出可完全结束。")
+                        log_info("最小化到托盘")
+                        continue
+                    # decision == "quit"：继续往下走，彻底退出
                 log_info("程序退出")
                 break
 
@@ -270,17 +349,25 @@ def main() -> int:
             input("按回车键继续...")
 
     # 退出时收掉常驻资源（托盘/热键/事件线程）
-    from ui import resident as resident_module
-    controller = resident_module.get_controller()
-    if controller is not None:
-        controller.stop()
-        resident_module.set_controller(None)
+    _stop_resident()
     singleton.release()
     return 0
 
 
-def _start_resident(config: dict, flags: dict) -> None:
-    """启动常驻控制器，并按需隐藏控制台。"""
+def _stop_resident() -> None:
+    """收掉常驻资源：移除托盘图标、注销热键、结束事件线程。"""
+    from ui import resident as resident_module
+    controller = resident_module.get_controller()
+    if controller is not None:
+        try:
+            controller.stop()
+        except Exception:
+            pass
+        resident_module.set_controller(None)
+
+
+def _start_resident(config: dict, flags: dict):
+    """启动常驻控制器，并按需隐藏控制台。成功返回控制器，失败返回 None。"""
     from core.config_manager import get_setting
     from ui import resident as resident_module
 
@@ -288,22 +375,25 @@ def _start_resident(config: dict, flags: dict) -> None:
     ok, message = controller.start()
     print(f"[常驻] {message}")
     if not ok:
-        return
+        return None
     resident_module.set_controller(controller)
 
     for combo, err in controller.hotkey_errors:
         print(f"[常驻][!] 热键 {combo} 注册失败: {err}")
+    for name, why in controller.skipped_hotkeys:
+        print(f"[常驻][i] {name} 绑定了热键但未生效：{why}（到「快捷预设」里启用后即可用）")
 
     summon = get_setting(config, "settings.hotkeys.summon", "") or "（未设置）"
     print(f"[常驻] 唤出/收起热键: {summon}；托盘左键同样可唤出。")
-
-    if not bool(get_setting(config, "settings.resident.close_to_tray", True)):
-        print("[常驻] 提示: 设置里的“关闭窗口时保留常驻”已关闭，退出程序将结束常驻。")
+    if bool(get_setting(config, "settings.notify.apply_requires_confirm", False)):
+        print("[常驻] 已开启「应用前需要二次确认」：按预设热键会先弹出确认框。")
 
     if controller.hide_console():
         print("[常驻] 控制台已隐藏（按唤出热键或点托盘图标可再次显示）。")
     else:
-        print("[常驻] 当前终端不支持隐藏控制台（Windows Terminal/ConPTY），已保留窗口。")
+        print("[常驻] 当前终端不支持隐藏控制台（Windows Terminal/ConPTY），已保留窗口；"
+              "关闭该窗口会直接结束进程。")
+    return controller
 
 
 if __name__ == "__main__":

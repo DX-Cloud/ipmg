@@ -326,5 +326,133 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(flags["resident"], False)
 
 
+class TestApplyConfirm(ResidentTestCase):
+    """设置项 notify.apply_requires_confirm：应用前必须真的有二次确认。"""
+
+    def _config_with_confirm(self):
+        config = make_config([preset()])
+        config["settings"]["notify"]["apply_requires_confirm"] = True
+        return config
+
+    def test_confirm_declined_aborts(self):
+        c = self.controller(self._config_with_confirm())
+        c.start()
+        self._patch(resident, "confirm_dialog", lambda title, text: False)
+        ok, text = c.apply_preset(0)
+        self.assertFalse(ok)
+        self.assertIn("已取消", text)
+        self.assertEqual(self.ops_calls["apply"], [], "用户没确认就不能改网卡")
+        self.assertEqual(self.ops_calls["backup"], 0, "取消时不应产生备份")
+
+    def test_confirm_accepted_applies(self):
+        c = self.controller(self._config_with_confirm())
+        c.start()
+        seen = []
+
+        def fake_confirm(title, text):
+            seen.append((title, text))
+            return True
+
+        self._patch(resident, "confirm_dialog", fake_confirm)
+        ok, _ = c.apply_preset(0)
+        self.assertTrue(ok)
+        self.assertEqual(self.ops_calls["apply"], [("以太网", "overwrite")])
+        self.assertTrue(seen, "确认框必须真的弹了")
+        self.assertIn("预设1", seen[0][1], "确认框里要写清应用的是哪个预设")
+
+    def test_no_dialog_when_setting_off(self):
+        c = self.controller(make_config([preset()]))   # 默认 False
+        c.start()
+        called = []
+        self._patch(resident, "confirm_dialog", lambda t, x: called.append(1) or True)
+        ok, _ = c.apply_preset(0)
+        self.assertTrue(ok)
+        self.assertEqual(called, [], "未开启二次确认时不应弹框")
+
+    def test_result_falls_back_to_dialog_when_balloon_fails(self):
+        c = self.controller(make_config([preset()]))
+        c.start()
+        c.console_hidden = True
+        c.host.notify = lambda *a, **k: False      # 模拟气泡发不出去
+        dialogs = []
+        self._patch(resident, "info_dialog",
+                    lambda title, text, warning=False: dialogs.append(text))
+        ok, _ = c.apply_preset(0)
+        self.assertTrue(ok)
+        self.assertTrue(dialogs, "气泡失败且控制台隐藏时，必须用弹窗兜底，否则用户什么都看不到")
+
+    def test_no_dialog_when_console_visible(self):
+        c = self.controller(make_config([preset()]))
+        c.start()
+        c.console_hidden = False
+        c.host.notify = lambda *a, **k: False
+        dialogs = []
+        self._patch(resident, "info_dialog",
+                    lambda title, text, warning=False: dialogs.append(text))
+        c.apply_preset(0)
+        self.assertEqual(dialogs, [], "控制台可见时结果已在界面上，不必再弹框")
+
+    def test_interactive_mode_always_shows_result_dialog_when_hidden(self):
+        """开启二次确认（=用户要交互式反馈）时，结果必须有可见回执，不能只靠气泡。"""
+        config = self._config_with_confirm()
+        c = self.controller(config)
+        c.start()
+        c.console_hidden = True
+        self._patch(resident, "confirm_dialog", lambda t, x: True)
+        dialogs = []
+        self._patch(resident, "info_dialog",
+                    lambda title, text, warning=False: dialogs.append(text))
+        ok, _ = c.apply_preset(0)
+        self.assertTrue(ok)
+        self.assertTrue(dialogs, "即使气泡发送成功，也要给出可见结果回执")
+
+    def test_disabled_preset_with_hotkey_is_reported(self):
+        config = make_config([preset(enabled=False, hotkey="Ctrl+Alt+3")])
+        c = self.controller(config)
+        c.start()
+        self.assertTrue(c.skipped_hotkeys, "绑了热键却没启用，必须在启动信息里说明")
+        self.assertIn("未启用", c.skipped_hotkeys[0][1])
+
+
+class TestExitToTray(unittest.TestCase):
+    """常驻状态下点"退出"应当默认最小化到托盘。"""
+
+    def _ask(self, close_to_tray, answer):
+        from core import config_manager as cm
+        from ui import widgets
+
+        saved = (cm.get_setting, widgets.pick_option)
+        captured = {}
+
+        cm.get_setting = lambda config, key, default=None: close_to_tray
+
+        def fake_pick(options, title, default_index=0, **kw):
+            captured["default"] = default_index
+            captured["options"] = list(options)
+            return answer
+
+        widgets.pick_option = fake_pick
+        try:
+            result = entry._ask_exit_resident({})
+        finally:
+            cm.get_setting, widgets.pick_option = saved
+        return result, captured
+
+    def test_tray_is_default_when_close_to_tray_on(self):
+        result, captured = self._ask(True, 0)
+        self.assertEqual(result, "tray")
+        self.assertEqual(captured["default"], 0, "开启'保留常驻'时默认最小化到托盘")
+        self.assertIn("托盘", captured["options"][0])
+
+    def test_quit_is_default_when_close_to_tray_off(self):
+        result, captured = self._ask(False, 1)
+        self.assertEqual(result, "quit")
+        self.assertEqual(captured["default"], 1)
+
+    def test_cancel_keeps_running(self):
+        result, _ = self._ask(True, -1)
+        self.assertEqual(result, "cancel")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
