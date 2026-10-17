@@ -22,6 +22,16 @@ WMI_ERROR_HINTS = {
 }
 
 
+# 未指定/缺失掩码时使用的系统默认子网掩码
+DEFAULT_SUBNET_MASK = "255.255.255.0"
+
+# 单块网卡允许配置的 IPv4 地址数上限（防御性上限，超过则拒绝写入）
+MAX_IPV4_PER_ADAPTER = 32
+
+# 单块网卡 IPv4 地址数达到该值起给出告警（提示可能影响网络稳定性）
+WARN_IPV4_COUNT = 8
+
+
 def _wmi_error_text(action: str, code: int) -> str:
     """生成带解决建议的错误提示。"""
     hint = WMI_ERROR_HINTS.get(code, "请检查网卡连接状态与 IP 配置后重试")
@@ -97,6 +107,45 @@ def _align_ipv4(ips, masks, default_mask: str = "") -> tuple:
         result_ips.append(addr)
         result_masks.append(mask)
     return result_ips, result_masks
+
+
+def merge_append_ips(ips, masks, new_ip: str, new_mask: str) -> tuple:
+    """
+    把 new_ip/new_mask 追加到现有地址列表之后，返回 (merged_ips, merged_masks)。
+
+    - 保持输入顺序：现有列表原样在前 → **主 IP 仍在结果 [0]**，新 IP 追加在末尾；
+    - **按 IP 去重**（首次出现优先，忽略掩码差异）：注意 `_align_ipv4` 是按 (ip, mask)
+      去重，朴素的 `_align_ipv4(list(ips) + [new_ip], ...)` 在"同 IP 异掩码"时会写出
+      重复地址，故这里用独立的按 IP 去重；
+    - 过滤 IPv6 / 空项（复用 `_is_ipv4`）；
+    - 掩码与地址按索引对齐，空掩码用 DEFAULT_SUBNET_MASK 补齐；
+    - new_ip 不是合法 IPv4 时抛 ValueError。
+    """
+    if not _is_ipv4(new_ip):
+        raise ValueError(f"追加的 IP 不是合法的 IPv4 地址: {new_ip!r}")
+
+    src_ips = _as_list(ips)
+    src_masks = _as_list(masks)
+
+    merged_ips, merged_masks = [], []
+    seen_ips = set()
+
+    def _push(addr, mask) -> None:
+        if not _is_ipv4(addr) or addr in seen_ips:
+            return
+        seen_ips.add(addr)
+        merged_ips.append(addr)
+        merged_masks.append(mask if isinstance(mask, str) and mask else DEFAULT_SUBNET_MASK)
+
+    # 现有地址：原样在前（主 IP 保持第 0 位），按 IP 去重
+    for i, addr in enumerate(src_ips):
+        mask = src_masks[i] if i < len(src_masks) else ""
+        _push(addr, mask)
+
+    # 新地址：追加在末尾
+    _push(new_ip, new_mask)
+
+    return merged_ips, merged_masks
 
 
 def set_static_ip(adapter_name: str, ip: str, mask: str, gateway: str = None,

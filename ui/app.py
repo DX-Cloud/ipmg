@@ -13,6 +13,7 @@ from core.adapter_manager import get_network_adapters, select_adapter
 from core import config_manager as cm
 from core import operations
 from core import update_check
+from core.ip_configurator import get_current_ip_config
 from core.config_manager import (
     get_devices, get_last_adapter_mac, get_ip_history, get_adapter_backup_stack,
     export_config, import_config,
@@ -214,15 +215,47 @@ def run_configure_flow(config: dict) -> dict:
             input("\n按回车键返回...")
             return config
 
+        # 配置前侦查：展示网卡现有地址，并判断"追加"是否可行（只读）
+        append_report = operations.inspect_append(selected_adapter.name, plan)
+        existing_ips = list(append_report.get("existing_ips") or [])
+        if existing_ips:
+            console.print(f"[dim]网卡当前地址: {'、'.join(existing_ips)}[/dim]")
+        for warning in append_report.get("warnings") or []:
+            console.print(f"[yellow][!] {warning}[/yellow]")
+
         # 简化确认：信息已在列表行展示，仅高风险字段（网关/手动IP）补充显示
         summary = (
             f"网卡 {selected_adapter.name} -> {plan['adapter_ip']}/{plan['mask']}"
             + (f"，网关 {plan['gateway']}" if plan.get("gateway") else "")
             + f"（设备 {selected_device.get('name', '')} {selected_device.get('device_ip', '')}）"
         )
-        if not widgets.confirm(f"确认配置: {summary}?", default=True):
+
+        # 默认模式取自设置；追加不可行时强制回落为覆盖，避免默认值把用户带进死路
+        default_mode = cm.get_setting(config, "settings.configure.default_mode", "overwrite")
+        if default_mode == "append" and not append_report.get("ok"):
+            default_mode = "overwrite"
+        default_choice = (widgets.CHOICE_APPEND if default_mode == "append"
+                          else widgets.CHOICE_OVERWRITE)
+
+        choice = widgets.confirm_three(f"确认配置: {summary}?", default=default_choice)
+        if choice == widgets.CHOICE_CANCEL:
             console.print("[yellow]已取消[/yellow]")
             return config
+
+        mode = "append" if choice == widgets.CHOICE_APPEND else "overwrite"
+        if mode == "append":
+            if not append_report.get("ok"):
+                # 明确拒绝而不是悄悄降级为覆盖：覆盖会清掉现有地址，风险更大
+                console.print(f"[red][X] 无法追加: {append_report.get('reason')}[/red]")
+                input("\n按回车键返回...")
+                return config
+            if append_report.get("already_present"):
+                console.print(
+                    f"[yellow][!] {plan['adapter_ip']} 已在该网卡上（掩码一致），无需追加[/yellow]"
+                )
+                return config
+
+        action_name = "追加IP" if mode == "append" else "配置IP"
 
         console.print("\n[bold cyan]正在备份网卡IP...[/bold cyan]")
         if operations.backup_current(config, selected_adapter):
@@ -230,21 +263,45 @@ def run_configure_flow(config: dict) -> dict:
         else:
             console.print("[yellow][!] 网卡IP备份失败（继续执行）[/yellow]")
 
-        console.print(f"[bold cyan]正在配置网卡IP为 {plan['adapter_ip']}...[/bold cyan]")
+        if mode == "append":
+            console.print(
+                f"[bold cyan]正在追加网卡IP {plan['adapter_ip']}（保留现有地址与网关）...[/bold cyan]"
+            )
+        else:
+            console.print(f"[bold cyan]正在配置网卡IP为 {plan['adapter_ip']}...[/bold cyan]")
         try:
-            success = operations.apply_static(selected_adapter.name, plan)
-        except RuntimeError as e:
+            success = operations.apply_static(selected_adapter.name, plan, mode=mode)
+        except (RuntimeError, ValueError) as e:
             console.print(f"[red][X] IP配置失败: {e}[/red]")
-            log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), f"失败: {e}")
+            log_operation(action_name, selected_adapter.name,
+                          selected_device.get("name", ""), f"失败: {e}")
             return _maybe_jump_restore(config)
 
         if not success:
             console.print("[red][X] IP配置失败（WMI返回失败）[/red]")
-            log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), "失败: WMI返回失败")
+            log_operation(action_name, selected_adapter.name,
+                          selected_device.get("name", ""), "失败: WMI返回失败")
             return _maybe_jump_restore(config)
 
-        console.print("[green][OK] IP配置成功[/green]")
-        log_operation("配置IP", selected_adapter.name, selected_device.get("name", ""), "成功")
+        console.print("[green][OK] IP追加成功[/green]" if mode == "append"
+                      else "[green][OK] IP配置成功[/green]")
+        log_operation(action_name, selected_adapter.name, selected_device.get("name", ""), "成功")
+
+        # 写后回读：确认地址真的写进去了，且追加模式下主 IP 与网关都没被改动
+        after = get_current_ip_config(selected_adapter.name) or {}
+        after_ips = list(after.get("ips") or [])
+        if after_ips:
+            console.print(f"[dim]网卡当前地址: {'、'.join(after_ips)}[/dim]")
+        if mode == "append":
+            if existing_ips and after_ips and after_ips[0] != existing_ips[0]:
+                console.print(
+                    f"[yellow][!] 主 IP 从 {existing_ips[0]} 变成了 {after_ips[0]}，请检查网卡设置[/yellow]"
+                )
+            before_gateways = list(append_report.get("existing_gateways") or [])
+            if before_gateways and not (after.get("gateways") or []):
+                console.print(
+                    "[yellow][!] 默认网关似乎丢失了，建议进入「恢复IP」或手动检查网卡网关[/yellow]"
+                )
 
         try:
             operations.save_state(config, selected_adapter.mac)
