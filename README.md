@@ -34,8 +34,6 @@ ipmg 把这个过程压缩成一次选择：
 - **纯 Windows 原生**：WMI 改地址、原生 TUI 交互（无需 GUI 框架）、单文件 exe 免安装
 - **可常驻**：托盘 + 全局热键 + 快捷预设，常用的"切到某网段"一键完成，支持开机自启
 
-> 本项目完全由 Vibe Coding 完成（Model: DeepSeek V4 Flash 正式版 | Tool: Codex）。
-
 ## 功能特性
 
 ### 配置与恢复
