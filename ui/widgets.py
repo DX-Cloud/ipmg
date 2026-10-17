@@ -105,10 +105,13 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
 
     if total_pages > 1:
         bottom = []
+        # 键盘模式：↑/↓ 是光标移动（到页边界才翻页），←/→ 与 n/p 才是直接翻页
+        prev_hint, next_hint = ("← 上一页(n)", "→ 下一页(p)") if cursor is not None \
+            else ("↑ 上一页(n)", "↓ 下一页(p)")
         if current_page > 0:
-            bottom.append("↑ 上一页(n)")
+            bottom.append(prev_hint)
         if current_page < total_pages - 1:
-            bottom.append("↓ 下一页(p)")
+            bottom.append(next_hint)
         lines.append(f"  [dim]{' | '.join(bottom)} (第{current_page + 1}/{total_pages}页)[/dim]")
 
     for i, ft in enumerate(fixed_tail):
@@ -122,7 +125,7 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
         keys = " ".join(f"{k}={hotkeys[k] + 1}" for k in sorted(hotkeys))
         lines.append(f"  [dim]快捷键: {keys}[/dim]")
     if cursor is not None:
-        lines.append("  [dim]↑/↓ 或 j/k 移动, 回车确认, c 复制, f 过滤[/dim]")
+        lines.append("  [dim]↑/↓ 或 j/k 移动, ←/→ 翻页, 回车确认, c 复制, f 过滤[/dim]")
     lines.append("-" * 55)
     return lines
 
@@ -199,6 +202,24 @@ def _page_nav(choice: str, current_page: int, total_pages: int) -> Optional[int]
     if choice.lower() in ("p", "prev", "<", ","):
         return max(current_page - 1, 0) if current_page > 0 else None
     return None
+
+
+def _page_entries(start: int, end: int, fixed_tail: Sequence[str],
+                  allow_back: bool) -> List[tuple]:
+    """当前页可导航条目：本页选项 + 固定尾部 + 返回。"""
+    entries: List[tuple] = [("opt", i) for i in range(start, end)]
+    entries += [("fixed", i) for i in range(len(fixed_tail))]
+    if allow_back:
+        entries.append(("back", None))
+    return entries
+
+
+def _last_selectable(entries: Sequence[tuple], non_selectable: Set[int]) -> int:
+    """最后一个可选条目的下标（向前跳过不可选的分组标题）。"""
+    pos = max(0, len(entries) - 1)
+    while pos > 0 and entries[pos][0] == "opt" and entries[pos][1] in non_selectable:
+        pos -= 1
+    return pos
 
 
 def pick_option(options: List[str], title: str, default_index: int = 0,
@@ -396,10 +417,7 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
         start = current_page * page_size
         end = min(start + page_size, len(options))
         # 当前页可导航条目：本页选项 + 固定尾部 + 返回
-        entries: List[tuple] = [("opt", i) for i in range(start, end)]
-        entries += [("fixed", i) for i in range(len(fixed_tail))]
-        if allow_back:
-            entries.append(("back", None))
+        entries = _page_entries(start, end, fixed_tail, allow_back)
 
         # 光标落在当前页第一个可选项上
         if current_page == 0 and not printed:
@@ -407,12 +425,13 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
             target = max(start, min(target, end - 1))
             cursor_pos = target - start
         if cursor_pos >= len(entries):
-            cursor_pos = max(0, len(entries) - 1)
+            cursor_pos = _last_selectable(entries, non_selectable)
         while cursor_pos < len(entries) and entries[cursor_pos][0] == "opt" \
                 and entries[cursor_pos][1] in non_selectable:
             cursor_pos += 1
         if cursor_pos >= len(entries):
-            cursor_pos = 0
+            # 本页尾部全是不可选条目：退到本页最后一个可选条目（原实现会跳回页首）
+            cursor_pos = _last_selectable(entries, non_selectable)
 
         frame = _render(title, options, start, end, page_size, current_page,
                         total_pages, fixed_tail, allow_back, hotkeys, note_fn,
@@ -435,6 +454,14 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                         and entries[new][1] in non_selectable:
                     new -= 1
                 cursor_pos = new
+            elif current_page > 0:
+                # 已在页首继续上移：翻到上一页，光标落在上一页最后一个可选条目
+                current_page -= 1
+                prev_entries = _page_entries(
+                    current_page * page_size,
+                    min(current_page * page_size + page_size, len(options)),
+                    fixed_tail, allow_back)
+                cursor_pos = _last_selectable(prev_entries, non_selectable)
         elif key in ("down", "j", "J"):
             if cursor_pos < len(entries) - 1:
                 new = cursor_pos + 1
@@ -442,6 +469,10 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                         and entries[new][1] in non_selectable:
                     new += 1
                 cursor_pos = new
+            elif current_page < total_pages - 1:
+                # 已在页尾继续下移：翻到下一页，光标落在下一页第一个可选条目
+                current_page += 1
+                cursor_pos = 0
         elif key == "enter":
             if number_buf and number_buf.isdigit():
                 entered = number_buf
@@ -469,11 +500,11 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
             return payload
         elif key == "escape" or (key == "0" and allow_back):
             return -1
-        elif key in ("n", "N"):
+        elif key in ("n", "N", "right"):
             if current_page < total_pages - 1:
                 current_page += 1
                 cursor_pos = 0
-        elif key in ("p", "P"):
+        elif key in ("p", "P", "left"):
             if current_page > 0:
                 current_page -= 1
                 cursor_pos = 0
