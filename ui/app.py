@@ -6,14 +6,12 @@
 """
 
 import os
-import time
 
 from rich.console import Console
 
 from core.adapter_manager import get_network_adapters, select_adapter
 from core import config_manager as cm
 from core import operations
-from core import preflight
 from core import update_check
 from core.config_manager import (
     get_devices, get_last_adapter_mac, get_ip_history, get_adapter_backup_stack,
@@ -165,7 +163,7 @@ def _maybe_jump_restore(config: dict) -> dict:
 
 
 def run_configure_flow(config: dict) -> dict:
-    """配置IP完整流程（选网卡 -> 选设备 -> 确认 -> 备份 -> 配置 -> 验证）。"""
+    """配置IP完整流程（选网卡 -> 选设备 -> 确认 -> 备份 -> 配置）。"""
     try:
         show_header(config)
 
@@ -216,23 +214,6 @@ def run_configure_flow(config: dict) -> dict:
             input("\n按回车键返回...")
             return config
 
-        # 配置前预检：错误阻止，警告提示后可继续
-        issues = preflight.run_preflight(adapters, selected_adapter, selected_device, plan)
-        if issues:
-            console.print("\n[bold]--- 配置预检 ---[/bold]")
-            for issue in issues:
-                if issue.level == "error":
-                    console.print(f"[red][X] {issue.message}[/red]")
-                else:
-                    console.print(f"[yellow][!] {issue.message}[/yellow]")
-                if issue.suggestion:
-                    console.print(f"  [dim]建议: {issue.suggestion}[/dim]")
-            errors = [i for i in issues if i.level == "error"]
-            if errors:
-                console.print("[red][X] 预检存在错误，已中止配置[/red]")
-                input("\n按回车键返回...")
-                return config
-
         # 简化确认：信息已在列表行展示，仅高风险字段（网关/手动IP）补充显示
         summary = (
             f"网卡 {selected_adapter.name} -> {plan['adapter_ip']}/{plan['mask']}"
@@ -269,16 +250,6 @@ def run_configure_flow(config: dict) -> dict:
             operations.save_state(config, selected_adapter.mac)
         except Exception as e:
             console.print(f"[yellow][!] 配置保存失败（不影响本次IP配置）: {e}[/yellow]")
-
-        console.print(f"\n[bold cyan]正在Ping设备 {selected_device.get('device_ip')} 验证连通性...[/bold cyan]")
-        time.sleep(1)
-        if operations.verify_device(selected_device.get("device_ip", ""), timeout=3):
-            console.print(f"[green][OK] 设备 {selected_device.get('device_ip')} 可达[/green]")
-        else:
-            console.print(
-                f"[yellow][!] 设备 {selected_device.get('device_ip')} 暂不可达"
-                "（可能设备未开机或需要等待）[/yellow]"
-            )
 
         operations.run_hooks(
             config, "after_configure",
