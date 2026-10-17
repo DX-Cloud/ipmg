@@ -440,29 +440,25 @@ class TestSummonWatcher(unittest.TestCase):
     def _run_watcher(self, controller):
         from core import singleton, win32host
         from ui import console as uconsole
+        import ui.resident as resident_module
 
         calls = {"raise": 0, "wake": 0, "show": 0}
         saved = [
             (singleton, "wait_activate", singleton.wait_activate),
             (win32host, "raise_console", win32host.raise_console),
             (uconsole, "wake", uconsole.wake),
-            (entry._start_summon_watcher.__globals__.get("_start_summon_watcher"), None, None),
+            (resident_module, "get_controller", resident_module.get_controller),
         ]
-        saved = saved[:3]
 
-        class FakeController:
-            def show_console(self):
-                calls["show"] += 1
-                return True
-
-        signals = [True, False, False]
+        signals = [True]
 
         def fake_wait(name, timeout_ms):
-            # 第一次返回"收到信号"，之后一直超时（避免刷屏）
-            return signals.pop(0) if signals else False
-
-        import ui.resident as resident_module
-        saved.append((resident_module, "get_controller", resident_module.get_controller))
+            # 第一次返回"收到信号"；随后抛 SystemExit 让监听线程干净退出
+            # （监听线程只捕获 Exception，SystemExit 会终止该 daemon 线程，
+            #   避免测试进程里残留一个 2Hz 空转线程）
+            if signals:
+                return signals.pop(0)
+            raise SystemExit
 
         singleton.wait_activate = fake_wait
         win32host.raise_console = lambda: calls.__setitem__("raise", calls["raise"] + 1) or True

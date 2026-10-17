@@ -309,7 +309,8 @@ class ResidentController:
         # 原网卡没有 IPv4（未连接/APIPA）时，备份是空的，撤销无法还原原地址 —— 提前说清
         try:
             stack = cm.get_adapter_backup_stack(self.config, adapter.mac)
-            if stack and not (stack[-1].get("ips") or stack[-1].get("ip")):
+            # 注意：备份栈 index 0 才是刚写入的那条（save_adapter_backup 用 insert(0, ...)）
+            if stack and not (stack[0].get("ips") or stack[0].get("ip")):
                 text += "（提示：该网卡原本没有 IPv4 地址，撤销时无法还原）"
         except Exception:
             pass

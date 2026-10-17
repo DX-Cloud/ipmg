@@ -1,15 +1,18 @@
 """
 网卡IP备份与恢复模块
-在修改网卡IP前备份原始配置到配置文件中，支持一键恢复
+
+- ``backup_adapter_config``：改网卡前把原配置存进配置文件（供撤销/历史恢复）
+- ``full_ip_fields`` / ``static_restore_args``：新旧备份格式之间的转换工具
+
+注意：真正的"恢复/撤销"执行入口是 ``core.operations``（restore_to_dhcp /
+undo_to_backup / history_restore），它们由调用方持有操作闸门。本模块不再提供
+直接写网卡的恢复函数，避免绕过闸门。
 """
 
 from typing import Optional, Dict, Any
 
-from core.config_manager import (
-    get_adapter_backup, save_adapter_backup, clear_adapter_backup, add_ip_history,
-    pop_adapter_backup, backup_stack_depth
-)
-from core.ip_configurator import get_current_ip_config, set_static_ip, set_dhcp
+from core.config_manager import save_adapter_backup, add_ip_history
+from core.ip_configurator import get_current_ip_config
 from utils.logger import log_error, log_exception
 
 
@@ -112,76 +115,3 @@ def backup_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> 
         log_error("备份网卡IP", f"网卡 {adapter_name!r} 备份异常: {type(e).__name__}: {e}")
         log_exception("备份网卡IP", f"网卡 {adapter_name!r}")
         return False
-
-
-def restore_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> tuple:
-    """
-    恢复网卡到上次备份的IP配置。
-    返回 (success: bool, error_msg: str)，成功时 error_msg 为空字符串。
-    """
-    try:
-        backup = get_adapter_backup(config, adapter_mac)
-        if backup is None:
-            return (False, "未找到备份记录")
-
-        if backup.get("is_dhcp", True):
-            # 原来是DHCP，恢复DHCP
-            success = set_dhcp(adapter_name)
-            if not success:
-                return (False, f"恢复DHCP失败 (网卡: {adapter_name})")
-        else:
-            # 原来是静态IP，恢复静态IP（新格式条目会一次性还原全部主/次要 IP）
-            try:
-                success = set_static_ip(adapter_name, **static_restore_args(backup))
-            except RuntimeError as e:
-                return (False, str(e))
-            if not success:
-                return (False, f"恢复静态IP失败 (网卡: {adapter_name})")
-
-        return (True, "")
-
-    except RuntimeError as e:
-        return (False, str(e))
-    except Exception as e:
-        return (False, f"恢复失败: {e}")
-
-
-def has_backup(adapter_mac: str, config: dict) -> bool:
-    """检查指定MAC的网卡是否存在备份"""
-    return get_adapter_backup(config, adapter_mac) is not None
-
-
-def undo_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> tuple:
-    """
-    撤销一次IP配置：弹出栈顶备份并恢复到该状态。
-    返回 (success: bool, backup: dict or None, error_msg: str)。
-    success=True 表示撤销成功，backup 为已应用的备份记录。
-    """
-    try:
-        backup, config = pop_adapter_backup(config, adapter_mac)
-        if backup is None:
-            return (False, None, "无可撤销的备份记录")
-
-        if backup.get("is_dhcp", True):
-            success = set_dhcp(adapter_name)
-            if not success:
-                return (False, backup, f"撤销DHCP失败 (网卡: {adapter_name})")
-        else:
-            try:
-                success = set_static_ip(adapter_name, **static_restore_args(backup))
-            except RuntimeError as e:
-                return (False, backup, str(e))
-            if not success:
-                return (False, backup, f"撤销静态IP失败 (网卡: {adapter_name})")
-
-        return (True, backup, "")
-
-    except RuntimeError as e:
-        return (False, None, str(e))
-    except Exception as e:
-        return (False, None, f"撤销失败: {e}")
-
-
-def undo_stack_depth(adapter_mac: str, config: dict) -> int:
-    """获取可撤销的备份数量"""
-    return backup_stack_depth(config, adapter_mac)

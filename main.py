@@ -87,7 +87,7 @@ USAGE = """ipmg - 网络设备IP一键配置工具
 
 选项:
   -r, --resident       常驻后台（托盘图标 + 全局热键），启动后隐藏控制台
-      --autostart-min  供开机自启任务使用：等价于 --resident，但不打印启动横幅
+      --autostart-min  供开机自启任务使用：等价于 --resident，但不打印常驻启动信息
       --no-singleton   跳过多实例检查（调试用）
       --selfcheck      打印环境自检结果后退出（不需要管理员）
   -h, --help           显示本帮助并退出
@@ -317,9 +317,17 @@ def main() -> int:
 
     # 管理员权限检测 - 自动提权
     if not is_admin():
+        # 提权会拉起一个新进程接管本程序：先把单实例让出去，
+        # 否则新进程会在父进程退出前看到互斥体仍被持有，误判"已在运行"而直接退出
+        singleton.release()
         if not run_as_admin():
             # 提权失败或用户取消，仍然继续运行（部分功能可能不可用）
             print("[!] 警告: 管理员提权失败，部分功能可能不可用")
+            if not flags["no_singleton"] and not singleton.acquire():
+                # 放弃让出期间被别人抢走了单实例：让位给既有实例
+                singleton.signal_existing()
+                print("[i] ipmg 已在运行，已请求既有实例显示窗口。")
+                return 0
             input("按回车键继续...")
 
     # 导入模块（延迟导入，加快启动感知速度）

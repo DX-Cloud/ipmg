@@ -81,6 +81,7 @@ class ConfigureFlowHarness:
             (operations, "get_current_ip_config", operations.get_current_ip_config),
             (operations, "backup_current", operations.backup_current),
             (operations, "apply_static", operations.apply_static),
+            (operations, "inspect_append", operations.inspect_append),
             (operations, "save_state", operations.save_state),
             (operations, "run_hooks", operations.run_hooks),
             (builtins, "input", builtins.input),
@@ -227,6 +228,26 @@ class TestConfigureFlowSafety(unittest.TestCase):
                           backup_stack=[{"ip": "", "ips": [], "masks": [], "is_dhcp": True}])
         self.assertIn("没有 IPv4 地址", out)
         self.assertEqual(h.calls["apply"], ["overwrite"], "提示不影响正常流程")
+
+    def test_empty_backup_uses_stack_top_not_bottom(self):
+        """
+        栈顶（index 0）才是刚写入的备份：最新一条有 IP、更早一条为空时**不能**误报。
+
+        回归：此前用 stack[-1]（最旧）判断，双向都会给错提示。
+        """
+        newest_has_ip = [
+            {"ip": "10.0.0.9", "ips": ["10.0.0.9"], "masks": ["255.255.255.0"]},
+            {"ip": "", "ips": [], "masks": []},
+        ]
+        h, out = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT, backup_stack=newest_has_ip)
+        self.assertNotIn("没有 IPv4 地址", out, "栈顶有 IP 时不应提示空备份")
+
+        newest_empty = [
+            {"ip": "", "ips": [], "masks": []},
+            {"ip": "10.0.0.9", "ips": ["10.0.0.9"], "masks": ["255.255.255.0"]},
+        ]
+        h2, out2 = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT, backup_stack=newest_empty)
+        self.assertIn("没有 IPv4 地址", out2, "栈顶为空时必须提示")
 
     def test_gate_busy_refuses_manual_configure(self):
         """后台热键应用正在写网卡时，前台流程必须拒绝而不是并发写。"""

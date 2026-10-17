@@ -36,10 +36,11 @@ GATE_WAIT_SECONDS = 30.0
 
 
 def _last_backup_is_empty(config: dict, mac: str) -> bool:
-    """栈顶备份是否没有任何 IPv4（未连接/APIPA 网卡备份为空，撤销时无地址可还原）。"""
+    """刚写入的备份是否没有任何 IPv4（未连接/APIPA 网卡备份为空，撤销时无地址可还原）。"""
     try:
         stack = get_adapter_backup_stack(config, mac)
-        return bool(stack) and not (stack[-1].get("ips") or stack[-1].get("ip"))
+        # 备份栈 index 0 = 最新（config_manager.save_adapter_backup 用 insert(0, ...)）
+        return bool(stack) and not (stack[0].get("ips") or stack[0].get("ip"))
     except Exception:
         return False
 
