@@ -281,7 +281,8 @@ class ResidentController:
 
         # 备份失败即中止：没有回滚点就不动网卡
         if not operations.backup_current(self.config, adapter):
-            return self._fail(f"{label}: 备份网卡IP失败，已中止")
+            return self._fail(
+                f"{label}: 备份网卡「{adapter.name}」失败，已中止（原因见日志）")
 
         mode = preset.get("mode") or "overwrite"
         try:
@@ -305,11 +306,19 @@ class ResidentController:
                       f"成功（{mode}）{plan.get('adapter_ip')}")
         text = (f"[OK] {label}: {adapter.name} -> {plan.get('adapter_ip')}"
                 f"（{'追加' if mode == 'append' else '覆盖'}）")
+        # 原网卡没有 IPv4（未连接/APIPA）时，备份是空的，撤销无法还原原地址 —— 提前说清
+        try:
+            stack = cm.get_adapter_backup_stack(self.config, adapter.mac)
+            if stack and not (stack[-1].get("ips") or stack[-1].get("ip")):
+                text += "（提示：该网卡原本没有 IPv4 地址，撤销时无法还原）"
+        except Exception:
+            pass
         self._report(text)
         return True, text
 
     # ------------------------------------------------------------------ 反馈
     def _fail(self, text: str) -> Tuple[bool, str]:
+        log_error("热键应用", text)      # 失败原因必须落日志，否则用户只看到一句无信息量的提示
         self._report(f"[X] {text}")
         return False, text
 

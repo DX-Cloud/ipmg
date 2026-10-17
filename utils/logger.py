@@ -88,6 +88,21 @@ def log_error(action: str, error_msg: str):
         pass
 
 
+def log_exception(action: str, error_msg: str = ""):
+    """
+    记录错误日志**并附上当前异常的堆栈**。
+
+    用于那些"捕获后返回 False/None"的路径：返回值语义保持不变，
+    但失败原因会落进日志，避免线上只看到一句没有信息量的"失败"。
+    """
+    try:
+        logger = _get_logger()
+        detail = f"{action} 错误: {error_msg}" if error_msg else action
+        logger.error(detail, exc_info=True)
+    except Exception:
+        pass
+
+
 def log_info(message: str):
     """记录信息日志"""
     try:

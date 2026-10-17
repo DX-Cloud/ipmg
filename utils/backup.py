@@ -10,6 +10,7 @@ from core.config_manager import (
     pop_adapter_backup, backup_stack_depth
 )
 from core.ip_configurator import get_current_ip_config, set_static_ip, set_dhcp
+from utils.logger import log_error, log_exception
 
 
 def full_ip_fields(current_config: Optional[dict]) -> Dict[str, list]:
@@ -69,6 +70,11 @@ def backup_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> 
     try:
         current_config = get_current_ip_config(adapter_name)
         if current_config is None:
+            # 读不到当前配置：把原因写进日志，否则上层只能看到"备份失败"这种无信息量的提示
+            log_error(
+                "备份网卡IP",
+                f"网卡 {adapter_name!r} 当前 IP 配置读取失败（WMI 查询返回空）",
+            )
             return False
 
         backup = {
@@ -100,7 +106,11 @@ def backup_adapter_config(adapter_name: str, adapter_mac: str, config: dict) -> 
 
         return True
 
-    except Exception:
+    except Exception as e:
+        # 以前这里静默返回 False，线上只看到"备份网卡IP失败"，无法定位；
+        # 现在把异常与堆栈写进日志（返回值语义不变）。
+        log_error("备份网卡IP", f"网卡 {adapter_name!r} 备份异常: {type(e).__name__}: {e}")
+        log_exception("备份网卡IP", f"网卡 {adapter_name!r}")
         return False
 
 

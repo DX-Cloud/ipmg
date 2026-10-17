@@ -4,11 +4,20 @@ IP配置执行模块
 实现网卡IP的设置和修改，避免 netsh 命令行调用开销
 """
 
+import threading
+
 import wmi
 from typing import Optional, Dict, Any
 
-# WMI 连接缓存
-_wmi_conn = None
+# WMI 连接按**线程**缓存。
+#
+# 为什么不能全局缓存：WMI 底层是 COM，COM 接口指针只能在创建它的线程里使用，
+# 跨线程调用会抛 COM 错误。而本程序有两个线程都会读写网卡：
+#   - TUI 主线程：手动"配置IP/恢复IP"
+#   - 常驻模式的热键工作线程：快捷键应用预设
+# 全局缓存会让后一个线程拿到别的线程创建的连接 → 直接失败
+# （表现为"备份网卡IP失败，已中止"这类看似莫名的错误）。
+_wmi_local = threading.local()
 
 # WMI 网卡配置常见返回码及解决建议
 WMI_ERROR_HINTS = {
@@ -38,12 +47,51 @@ def _wmi_error_text(action: str, code: int) -> str:
     return f"{action} 返回错误码: {code}\n建议: {hint}"
 
 
+def _ensure_com_initialized() -> None:
+    """
+    确保**当前线程**已初始化 COM。
+
+    WMI 底层是 COM：线程里首次使用前必须调用 ``pythoncom.CoInitialize[Ex]``，
+    否则 wmi 会抛 ``x_wmi_uninitialised_thread``（"you're probably running inside a
+    thread without first calling pythoncom.CoInitialize"）。
+
+    常驻模式的热键应用跑在独立工作线程里，而 TUI 的"配置IP"跑在主线程——
+    主线程通常已被 pywin32 隐式初始化，所以只有热键路径会踩到，且表现为
+    "备份网卡IP失败，已中止"这类看不出原因的失败（异常被上层吞掉了）。
+    """
+    if getattr(_wmi_local, "com_ready", False):
+        return
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        # 已初始化/无 pythoncom 都继续往下走，让真正的查询去报错
+        pass
+    _wmi_local.com_ready = True
+
+
 def _get_wmi():
-    """获取WMI连接（缓存复用）"""
-    global _wmi_conn
-    if _wmi_conn is None:
-        _wmi_conn = wmi.WMI()
-    return _wmi_conn
+    """获取当前线程的 WMI 连接（按线程缓存 + 确保 COM 已初始化）。"""
+    conn = getattr(_wmi_local, "conn", None)
+    if conn is None:
+        _ensure_com_initialized()
+        conn = wmi.WMI()
+        _wmi_local.conn = conn
+    return conn
+
+
+def _retry_wmi(func):
+    """
+    执行一次 WMI 操作；连接类错误时丢弃本线程连接并重试一次。
+
+    长驻进程里 WMI 连接可能因为 WMI 服务重启、网卡热插拔等原因失效，
+    而错误往往表现为"莫名其妙查不到网卡"。重建连接重试一次即可恢复。
+    """
+    try:
+        return func()
+    except Exception:
+        reset_wmi_connection()
+        return func()
 
 
 def _get_adapter_config_by_name(adapter_name: str) -> Optional[Any]:
@@ -51,16 +99,42 @@ def _get_adapter_config_by_name(adapter_name: str) -> Optional[Any]:
     通过网卡友好名称（NetConnectionID）查找对应的配置对象。
     关联方式：Win32_NetworkAdapter.DeviceID = Win32_NetworkAdapterConfiguration.Index
     """
-    c = _get_wmi()
 
-    # 通过 Win32_NetworkAdapter 查找 NetConnectionID 匹配的网卡
-    for adapter in c.Win32_NetworkAdapter(NetConnectionID=adapter_name):
-        device_id = adapter.DeviceID
-        # 通过 Index 关联到 NetworkAdapterConfiguration
-        for config in c.Win32_NetworkAdapterConfiguration(Index=device_id):
-            return config
+    def _lookup():
+        c = _get_wmi()
 
-    return None
+        # 通过 Win32_NetworkAdapter 查找 NetConnectionID 匹配的网卡
+        for adapter in c.Win32_NetworkAdapter(NetConnectionID=adapter_name):
+            device_id = adapter.DeviceID
+            # 通过 Index 关联到 NetworkAdapterConfiguration
+            for config in c.Win32_NetworkAdapterConfiguration(Index=device_id):
+                return config
+
+        return None
+
+    return _retry_wmi(_lookup)
+
+
+def _get_adapter_config_retry(adapter_name: str) -> Optional[Any]:
+    """
+    查网卡配置；第一次查不到**或报错**时，丢弃本线程连接再查一次。
+
+    长驻进程的 WMI 连接失效时，查询可能静默返回空结果、也可能直接抛 COM 错误，
+    两种都要重试一次，避免把连接问题误报成"网卡不存在"。
+    本函数保证不向上抛异常（失败返回 None），调用方按"查不到"处理即可。
+    """
+    try:
+        config = _get_adapter_config_by_name(adapter_name)
+    except Exception:
+        config = None
+    if config is not None:
+        return config
+
+    reset_wmi_connection()
+    try:
+        return _get_adapter_config_by_name(adapter_name)
+    except Exception:
+        return None
 
 
 def _is_ipv4(addr: Any) -> bool:
@@ -162,7 +236,7 @@ def set_static_ip(adapter_name: str, ip: str, mask: str, gateway: str = None,
     - gateways：可选，完整网关列表（优先于 gateway 单值）。
     """
     try:
-        config = _get_adapter_config_by_name(adapter_name)
+        config = _get_adapter_config_retry(adapter_name)
         if config is None:
             return False
 
@@ -209,7 +283,7 @@ def set_dhcp(adapter_name: str) -> bool:
     直接调用 WMI EnableDHCP。
     成功返回 True，失败抛出 RuntimeError（含用户友好提示）。
     """
-    config = _get_adapter_config_by_name(adapter_name)
+    config = _get_adapter_config_retry(adapter_name)
     if config is None:
         raise RuntimeError(f"未找到网卡 '{adapter_name}' 的WMI配置对象")
 
@@ -243,7 +317,7 @@ def get_current_ip_config(adapter_name: str) -> Optional[Dict[str, Any]]:
     索引 0 为主 IP，其余为次要 IP；查询失败返回 None。
     """
     try:
-        config = _get_adapter_config_by_name(adapter_name)
+        config = _get_adapter_config_retry(adapter_name)
         if config is None:
             return None
 
@@ -278,6 +352,5 @@ def get_current_ip_config(adapter_name: str) -> Optional[Dict[str, Any]]:
 
 
 def reset_wmi_connection():
-    """重置WMI连接缓存"""
-    global _wmi_conn
-    _wmi_conn = None
+    """丢弃**当前线程**的 WMI 连接缓存（下次访问会重建）。"""
+    _wmi_local.conn = None
