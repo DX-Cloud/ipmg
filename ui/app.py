@@ -20,6 +20,7 @@ from core.config_manager import (
 )
 from core.network_utils import resolve_adapter_ip, resolve_management_url
 from core.browser_launcher import open_management_page, open_url
+from core.opgate import gate, OperationBusy
 from core.version import APP_VERSION, APP_VERSION_DISPLAY, GITHUB_REPO
 from utils.logger import log_operation, log_error
 from ui import widgets, status
@@ -29,6 +30,18 @@ from ui.header import show_header
 from ui.settings import show_settings
 
 console = Console()
+
+# 前台操作等待后台热键应用让出闸门的最长时间（秒）
+GATE_WAIT_SECONDS = 30.0
+
+
+def _last_backup_is_empty(config: dict, mac: str) -> bool:
+    """栈顶备份是否没有任何 IPv4（未连接/APIPA 网卡备份为空，撤销时无地址可还原）。"""
+    try:
+        stack = get_adapter_backup_stack(config, mac)
+        return bool(stack) and not (stack[-1].get("ips") or stack[-1].get("ip"))
+    except Exception:
+        return False
 
 
 # ============== 设备选择 ==============
@@ -257,56 +270,76 @@ def run_configure_flow(config: dict) -> dict:
 
         action_name = "追加IP" if mode == "append" else "配置IP"
 
-        console.print("\n[bold cyan]正在备份网卡IP...[/bold cyan]")
-        if operations.backup_current(config, selected_adapter):
-            console.print("[green][OK] 网卡IP备份成功[/green]")
-        else:
-            console.print("[yellow][!] 网卡IP备份失败（继续执行）[/yellow]")
-
-        if mode == "append":
-            console.print(
-                f"[bold cyan]正在追加网卡IP {plan['adapter_ip']}（保留现有地址与网关）...[/bold cyan]"
-            )
-        else:
-            console.print(f"[bold cyan]正在配置网卡IP为 {plan['adapter_ip']}...[/bold cyan]")
+        # 持操作闸门：后台热键应用也在写网卡，两边必须串行（前台可以等一会儿）
+        if not gate.acquire(action_name, timeout=GATE_WAIT_SECONDS):
+            console.print(f"[yellow][!] {gate.busy_reason}，请稍后重试[/yellow]")
+            input("\n按回车键返回...")
+            return config
         try:
-            success = operations.apply_static(selected_adapter.name, plan, mode=mode)
-        except (RuntimeError, ValueError) as e:
-            console.print(f"[red][X] IP配置失败: {e}[/red]")
-            log_operation(action_name, selected_adapter.name,
-                          selected_device.get("name", ""), f"失败: {e}")
-            return _maybe_jump_restore(config)
+            console.print("\n[bold cyan]正在备份网卡IP...[/bold cyan]")
+            if operations.backup_current(config, selected_adapter):
+                console.print("[green][OK] 网卡IP备份成功[/green]")
+                if _last_backup_is_empty(config, selected_adapter.mac):
+                    console.print(
+                        "[yellow][!] 该网卡当前没有 IPv4 地址（未连接/APIPA），"
+                        "撤销时无法还原原地址[/yellow]"
+                    )
+            else:
+                # 没有回滚点就默认不动网卡；用户可在明确知情后选择继续
+                console.print("[red][X] 网卡IP备份失败（没有回滚点）[/red]")
+                log_operation(action_name, selected_adapter.name,
+                              selected_device.get("name", ""), "中止: 备份失败")
+                if not widgets.confirm(
+                        "备份失败，仍要继续配置吗？（将无法撤销到操作前）", default=False):
+                    console.print("[yellow]已中止[/yellow]")
+                    return config
 
-        if not success:
-            console.print("[red][X] IP配置失败（WMI返回失败）[/red]")
-            log_operation(action_name, selected_adapter.name,
-                          selected_device.get("name", ""), "失败: WMI返回失败")
-            return _maybe_jump_restore(config)
-
-        console.print("[green][OK] IP追加成功[/green]" if mode == "append"
-                      else "[green][OK] IP配置成功[/green]")
-        log_operation(action_name, selected_adapter.name, selected_device.get("name", ""), "成功")
-
-        # 写后回读：确认地址真的写进去了，且追加模式下主 IP 与网关都没被改动
-        after = get_current_ip_config(selected_adapter.name) or {}
-        after_ips = list(after.get("ips") or [])
-        if after_ips:
-            console.print(f"[dim]网卡当前地址: {'、'.join(after_ips)}[/dim]")
-        if mode == "append":
-            if existing_ips and after_ips and after_ips[0] != existing_ips[0]:
+            if mode == "append":
                 console.print(
-                    f"[yellow][!] 主 IP 从 {existing_ips[0]} 变成了 {after_ips[0]}，请检查网卡设置[/yellow]"
+                    f"[bold cyan]正在追加网卡IP {plan['adapter_ip']}（保留现有地址与网关）...[/bold cyan]"
                 )
-            before_gateways = list(append_report.get("existing_gateways") or [])
-            if before_gateways and not (after.get("gateways") or []):
-                console.print(
-                    "[yellow][!] 默认网关似乎丢失了，建议进入「恢复IP」或手动检查网卡网关[/yellow]"
-                )
+            else:
+                console.print(f"[bold cyan]正在配置网卡IP为 {plan['adapter_ip']}...[/bold cyan]")
+            try:
+                success = operations.apply_static(selected_adapter.name, plan, mode=mode)
+            except (RuntimeError, ValueError) as e:
+                console.print(f"[red][X] IP配置失败: {e}[/red]")
+                log_operation(action_name, selected_adapter.name,
+                              selected_device.get("name", ""), f"失败: {e}")
+                return _maybe_jump_restore(config)
 
-        try:
-            operations.save_state(config, selected_adapter.mac)
-        except Exception as e:
-            console.print(f"[yellow][!] 配置保存失败（不影响本次IP配置）: {e}[/yellow]")
+            if not success:
+                console.print("[red][X] IP配置失败（WMI返回失败）[/red]")
+                log_operation(action_name, selected_adapter.name,
+                              selected_device.get("name", ""), "失败: WMI返回失败")
+                return _maybe_jump_restore(config)
+
+            console.print("[green][OK] IP追加成功[/green]" if mode == "append"
+                          else "[green][OK] IP配置成功[/green]")
+            log_operation(action_name, selected_adapter.name, selected_device.get("name", ""), "成功")
+
+            # 写后回读：确认地址真的写进去了，且追加模式下主 IP 与网关都没被改动
+            after = get_current_ip_config(selected_adapter.name) or {}
+            after_ips = list(after.get("ips") or [])
+            if after_ips:
+                console.print(f"[dim]网卡当前地址: {'、'.join(after_ips)}[/dim]")
+            if mode == "append":
+                if existing_ips and after_ips and after_ips[0] != existing_ips[0]:
+                    console.print(
+                        f"[yellow][!] 主 IP 从 {existing_ips[0]} 变成了 {after_ips[0]}，请检查网卡设置[/yellow]"
+                    )
+                before_gateways = list(append_report.get("existing_gateways") or [])
+                if before_gateways and not (after.get("gateways") or []):
+                    console.print(
+                        "[yellow][!] 默认网关似乎丢失了，建议进入「恢复IP」或手动检查网卡网关[/yellow]"
+                    )
+
+            try:
+                operations.save_state(config, selected_adapter.mac)
+            except Exception as e:
+                console.print(f"[yellow][!] 配置保存失败（不影响本次IP配置）: {e}[/yellow]")
+        finally:
+            gate.release()
 
         operations.run_hooks(
             config, "after_configure",
@@ -443,7 +476,8 @@ def _do_restore_dhcp(config: dict, adapter) -> dict:
     if not widgets.confirm("确认恢复?", default=True):
         return config
     try:
-        ok, message, config = operations.restore_to_dhcp(config, adapter)
+        with gate.hold("恢复IP", timeout=GATE_WAIT_SECONDS):
+            ok, message, config = operations.restore_to_dhcp(config, adapter)
         if ok:
             console.print("[green][OK] 已恢复为 DHCP 自动获取[/green]")
             log_operation("恢复IP", adapter.name, result="成功 -> DHCP")
@@ -451,6 +485,8 @@ def _do_restore_dhcp(config: dict, adapter) -> dict:
             status.set_last_result(f"[OK] 恢复完成: {adapter.name} -> DHCP")
         else:
             console.print(f"[red][X] {message}[/red]")
+    except OperationBusy as e:
+        console.print(f"[yellow][!] {e}，请稍后重试[/yellow]")
     except RuntimeError as e:
         console.print(f"[red][X] {e}[/red]")
     return config
@@ -466,14 +502,18 @@ def _do_undo_restore(config: dict, adapter, backup: dict) -> dict:
         console.print("[yellow]已取消[/yellow]")
         return config
 
-    ok, message, config = operations.undo_to_backup(config, adapter, backup)
-    if ok:
-        console.print(f"[green][OK] 已恢复为: {message}[/green]")
-        log_operation("撤销IP", adapter.name, result=f"撤销到 {message}")
-        operations.run_hooks(config, "after_restore", adapter=adapter.name)
-        status.set_last_result(f"[OK] 撤销完成: {adapter.name} -> {message}")
-    else:
-        console.print(f"[red][X] {message}[/red]")
+    try:
+        with gate.hold("撤销IP", timeout=GATE_WAIT_SECONDS):
+            ok, message, config = operations.undo_to_backup(config, adapter, backup)
+        if ok:
+            console.print(f"[green][OK] 已恢复为: {message}[/green]")
+            log_operation("撤销IP", adapter.name, result=f"撤销到 {message}")
+            operations.run_hooks(config, "after_restore", adapter=adapter.name)
+            status.set_last_result(f"[OK] 撤销完成: {adapter.name} -> {message}")
+        else:
+            console.print(f"[red][X] {message}[/red]")
+    except OperationBusy as e:
+        console.print(f"[yellow][!] {e}，请稍后重试[/yellow]")
     return config
 
 
@@ -491,7 +531,8 @@ def _do_history_restore(config: dict, adapter, record: dict) -> dict:
         return config
 
     try:
-        ok, message, config = operations.history_restore(config, adapter, record)
+        with gate.hold("恢复IP", timeout=GATE_WAIT_SECONDS):
+            ok, message, config = operations.history_restore(config, adapter, record)
         if ok:
             console.print(f"[green][OK] 已恢复为静态IP: {message}[/green]")
             log_operation("恢复IP", adapter.name, result=f"成功 -> {message}")
@@ -499,6 +540,8 @@ def _do_history_restore(config: dict, adapter, record: dict) -> dict:
             status.set_last_result(f"[OK] 恢复完成: {adapter.name} -> {message}")
         else:
             console.print(f"[red][X] {message}[/red]")
+    except OperationBusy as e:
+        console.print(f"[yellow][!] {e}，请稍后重试[/yellow]")
     except RuntimeError as e:
         console.print(f"[red][X] {e}[/red]")
     return config
@@ -556,11 +599,20 @@ def run_export_import_flow(config: dict, mode: str) -> dict:
 
 # ============== 检查更新 ==============
 
+def _update_urls(config: dict):
+    """设置里填了自定义检测地址（镜像站）就只查它，否则返回 None 用内置源。"""
+    custom = str(cm.get_setting(config, "settings.update_check.url", "") or "").strip()
+    return [custom] if custom else None
+
+
 def run_check_update_flow(config: dict) -> dict:
     """手动检查更新：检测最新版本并展示，可打开 Release 页面。"""
     show_header(config)
     console.print("[cyan]正在检查更新...[/cyan]")
-    result = update_check.check_latest()
+    urls = _update_urls(config)
+    if urls:
+        console.print(f"[dim]检测地址（设置里的自定义源）: {urls[0]}[/dim]")
+    result = update_check.check_latest(urls)
     if not result:
         console.print("[yellow][!] 未获取到版本信息（网络不可达或检测源失效）[/yellow]")
         input("\n按回车键返回...")

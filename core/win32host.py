@@ -806,3 +806,28 @@ class Win32Host(threading.Thread):
         except Exception as exc:  # pragma: no cover - 尽力而为
             _log.debug("_force_foreground 失败: %s", exc)
         return False
+
+
+def raise_console() -> bool:
+    """
+    显示并前置本进程的控制台窗口（**不需要** Win32Host 实例）。
+
+    用途：重复启动时，第二个实例通过命名事件请求"唤出"，由既有实例调用本函数
+    把自己的窗口拉到用户眼前。非常驻实例没有 Win32Host，因此单独提供。
+
+    无控制台窗口（ConPTY/无控制台）时返回 False，绝不抛异常。
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        hwnd = _kernel32.GetConsoleWindow()
+        if not hwnd:
+            _log.debug("raise_console: 无控制台窗口（ConPTY/无控制台），返回 False")
+            return False
+        _user32.ShowWindow(hwnd, SW_SHOW)
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+        Win32Host._force_foreground(hwnd)
+        return bool(_user32.IsWindowVisible(hwnd))
+    except Exception as exc:
+        _log.warning("raise_console 失败: %s", exc)
+        return False

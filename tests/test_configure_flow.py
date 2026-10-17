@@ -53,10 +53,14 @@ def current_config(ips, masks, gateways, dhcp=False):
 class ConfigureFlowHarness:
     """把配置流程的外部依赖全部替换成可断言的假实现。"""
 
-    def __init__(self, choice, current, already_present=False):
+    def __init__(self, choice, current, already_present=False,
+                 backup_ok=True, confirm_continue=False, backup_stack=None):
         self.choice = choice
         self.current = current
-        self.calls = {"apply": [], "backup": 0, "logs": [], "hooks": 0}
+        self.backup_ok = backup_ok
+        self.confirm_continue = confirm_continue
+        self.backup_stack = backup_stack
+        self.calls = {"apply": [], "backup": 0, "logs": [], "hooks": 0, "confirm": []}
         self.already_present = already_present
         self._saved = []
 
@@ -70,7 +74,9 @@ class ConfigureFlowHarness:
             (app, "_pick_device", app._pick_device),
             (app, "get_current_ip_config", app.get_current_ip_config),
             (app, "log_operation", app.log_operation),
+            (app, "get_adapter_backup_stack", app.get_adapter_backup_stack),
             (widgets, "pick_option", widgets.pick_option),
+            (widgets, "confirm", widgets.confirm),
             (widgets, "confirm_three", widgets.confirm_three),
             (operations, "get_current_ip_config", operations.get_current_ip_config),
             (operations, "backup_current", operations.backup_current),
@@ -89,11 +95,20 @@ class ConfigureFlowHarness:
         app._pick_device = lambda config, adapter: dict(DEVICE)
         app.get_current_ip_config = lambda name: dict(self.current)
         app.log_operation = lambda *a, **k: self.calls["logs"].append(a)
+        app.get_adapter_backup_stack = lambda config, mac: list(self.backup_stack or [])
         app.cm.get_setting = lambda config, key, default=None: (
             "overwrite" if key.endswith("default_mode") else default)
 
         widgets.pick_option = lambda *a, **k: 0
         widgets.confirm_three = lambda prompt, default=widgets.CHOICE_OVERWRITE: self.choice
+
+        def fake_confirm(prompt, default=True):
+            self.calls["confirm"].append((prompt, default))
+            if "仍要继续配置" in prompt:
+                return self.confirm_continue
+            return default
+
+        widgets.confirm = fake_confirm
 
         operations.get_current_ip_config = lambda name: dict(self.current)
 
@@ -120,7 +135,7 @@ class ConfigureFlowHarness:
 
         operations.inspect_append = fake_inspect
         operations.backup_current = lambda config, adapter: (
-            self.calls.__setitem__("backup", self.calls["backup"] + 1) or True)
+            self.calls.__setitem__("backup", self.calls["backup"] + 1) or self.backup_ok)
 
         def fake_apply(adapter_name, plan, mode="overwrite"):
             self.calls["apply"].append(mode)
@@ -139,9 +154,9 @@ class ConfigureFlowHarness:
         return False
 
 
-def run_flow(choice, current, already_present=False):
+def run_flow(choice, current, already_present=False, **kw):
     buf = io.StringIO()
-    with ConfigureFlowHarness(choice, current, already_present) as h:
+    with ConfigureFlowHarness(choice, current, already_present, **kw) as h:
         with redirect_stdout(buf):
             app.run_configure_flow({"settings": {}, "devices": [DEVICE]})
     return h, buf.getvalue()
@@ -184,6 +199,79 @@ class TestConfigureFlowChoices(unittest.TestCase):
         self.assertEqual(h.calls["apply"], [], "地址已存在时无需写 WMI")
         self.assertEqual(h.calls["backup"], 0, "没有实际改动就不必备份")
         self.assertIn("无需追加", out)
+
+
+class TestConfigureFlowSafety(unittest.TestCase):
+    """备份失败、操作闸门、空备份提示 —— 与后台热键共存时的安全边界。"""
+
+    CURRENT = current_config(["10.0.0.5"], ["255.255.255.0"], ["10.0.0.1"])
+
+    def test_backup_failure_aborts_by_default(self):
+        """备份失败默认不动网卡（没有回滚点）。"""
+        h, out = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT, backup_ok=False)
+        self.assertEqual(h.calls["apply"], [], "备份失败时不得写网卡")
+        self.assertIn("备份失败", out)
+        self.assertIn("已中止", out)
+        self.assertEqual(h.calls["confirm"][0][1], False,
+                         "确认框必须以'拒绝'为默认值")
+
+    def test_backup_failure_continues_when_explicitly_confirmed(self):
+        h, out = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT,
+                          backup_ok=False, confirm_continue=True)
+        self.assertEqual(h.calls["apply"], ["overwrite"],
+                         "用户明确确认后才允许继续")
+
+    def test_empty_backup_warns_about_undo(self):
+        """栈顶备份没有 IPv4（未连接/APIPA 网卡）时要提示无法撤销还原。"""
+        h, out = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT,
+                          backup_stack=[{"ip": "", "ips": [], "masks": [], "is_dhcp": True}])
+        self.assertIn("没有 IPv4 地址", out)
+        self.assertEqual(h.calls["apply"], ["overwrite"], "提示不影响正常流程")
+
+    def test_gate_busy_refuses_manual_configure(self):
+        """后台热键应用正在写网卡时，前台流程必须拒绝而不是并发写。"""
+        from core.opgate import gate
+        import threading
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def hog():
+            gate.acquire("热键应用")
+            started.set()
+            release.wait(5)
+            gate.release()
+
+        thread = threading.Thread(target=hog, name="gate-hog", daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(2))
+        saved_timeout = app.GATE_WAIT_SECONDS
+        app.GATE_WAIT_SECONDS = 0.05          # 测试里不真等 30 秒
+        try:
+            h, out = run_flow(widgets.CHOICE_OVERWRITE, self.CURRENT)
+        finally:
+            app.GATE_WAIT_SECONDS = saved_timeout
+            release.set()
+            thread.join(3)
+        self.assertEqual(h.calls["apply"], [], "抢不到闸门绝不能写网卡")
+        self.assertIn("请稍后重试", out)
+        self.assertIn("热键应用", out, "提示里要说明被什么操作占用")
+
+
+class TestUpdateUrlSetting(unittest.TestCase):
+    """设置里的自定义检测地址（镜像站）必须真的被使用。"""
+
+    def test_custom_url_used(self):
+        config = {"settings": {"update_check": {"url": "https://mirror.example/v.json"}}}
+        self.assertEqual(app._update_urls(config), ["https://mirror.example/v.json"])
+
+    def test_blank_url_falls_back_to_builtin(self):
+        for value in ("", "   ", None):
+            config = {"settings": {"update_check": {"url": value}}}
+            self.assertIsNone(app._update_urls(config), "留空应使用内置源")
+
+    def test_missing_settings_is_safe(self):
+        self.assertIsNone(app._update_urls({}))
 
 
 if __name__ == "__main__":

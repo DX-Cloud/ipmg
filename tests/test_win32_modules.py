@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import unittest
+import uuid
 
 # 允许从仓库任意位置运行（python -m unittest ... 已含 cwd，这里再兜底一次）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -125,6 +126,10 @@ class TestNotifyIconDataLayout(unittest.TestCase):
 class TestSingleton(unittest.TestCase):
     """互斥体与命名事件（同进程内可验证的路径）。"""
 
+    # 每个测试进程用唯一名字：避免与真实运行的实例（或上一次跑残留的对象）互相干扰。
+    # 用生产名 "ipmg" 的测试曾在有实例常驻时整片失败，属于测试自身的设计问题。
+    APP = f"ipmg-test-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
     def setUp(self):
         singleton.release()
 
@@ -136,37 +141,76 @@ class TestSingleton(unittest.TestCase):
         self.assertEqual(singleton.event_name("ipmg"), "Local\\ipmg.activate")
 
     def test_acquire_release_reacquire(self):
-        self.assertTrue(singleton.acquire("ipmg"))
-        self.assertTrue(singleton.acquire("ipmg"), "同一进程重复 acquire 应幂等返回 True")
+        self.assertTrue(singleton.acquire(self.APP))
+        self.assertTrue(singleton.acquire(self.APP), "同一进程重复 acquire 应幂等返回 True")
         singleton.release()
-        self.assertTrue(singleton.acquire("ipmg"), "release 后应能重新获取")
+        self.assertTrue(singleton.acquire(self.APP), "release 后应能重新获取")
 
-    def test_acquire_false_when_already_exists(self):
-        """外部已持有同名互斥体 → acquire 必须返回 False（ERROR_ALREADY_EXISTS）。"""
+    def test_acquire_false_when_owned_by_another(self):
+        """
+        另一个**线程/进程**持有同名互斥体时，acquire 必须返回 False。
+
+        注意：互斥体所有权按线程归属且可递归，同线程内再获取总是成功，
+        因此必须让"外部持有者"跑在另一个线程里才构成真实占用。
+        """
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
         k32.CreateMutexW.restype = ctypes.c_void_p
         k32.CloseHandle.argtypes = [ctypes.c_void_p]
-        foreign = k32.CreateMutexW(None, True, singleton.mutex_name("ipmg"))
+
+        name = singleton.mutex_name(self.APP)
+        ready = threading.Event()
+        release_holder = threading.Event()
+
+        def holder_thread():
+            handle = k32.CreateMutexW(None, True, name)   # 由本线程持有
+            ready.set()
+            release_holder.wait(5)
+            k32.CloseHandle(handle)                       # 关句柄即释放所有权
+
+        thread = threading.Thread(target=holder_thread, name="mutex-holder", daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(3), "测试前置：持有线程应就绪")
+        try:
+            self.assertFalse(singleton.acquire(self.APP),
+                             "被其它线程持有时不应取得所有权")
+        finally:
+            release_holder.set()
+            thread.join(3)
+        self.assertTrue(singleton.acquire(self.APP), "持有者释放后应能获取")
+
+    def test_acquire_succeeds_when_object_exists_but_unowned(self):
+        """
+        回归：同名对象存在但**无人持有**时，acquire 必须成功。
+
+        旧实现只看 CreateMutexW 的 ERROR_ALREADY_EXISTS，这种残留对象会让程序
+        永久以为"已有实例在运行"而拒绝启动。
+        """
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # bInitialOwner=False → 对象被创建，但没有任何进程持有它
+        foreign = k32.CreateMutexW(None, False, singleton.mutex_name(self.APP))
         self.assertTrue(foreign, "测试前置：应能创建同名互斥体")
         try:
-            self.assertFalse(singleton.acquire("ipmg"))
+            self.assertTrue(singleton.acquire(self.APP),
+                            "对象存在但无人持有时应能取得所有权")
         finally:
+            singleton.release()
             k32.CloseHandle(foreign)
-        # 外部句柄释放后，本进程仍应能获取
-        self.assertTrue(singleton.acquire("ipmg"))
 
     def test_wait_activate_timeout_returns_false(self):
-        self.assertFalse(singleton.wait_activate("ipmg", 150))
+        self.assertFalse(singleton.wait_activate(self.APP, 150))
 
     def test_signal_without_waiter_returns_false(self):
-        self.assertFalse(singleton.signal_existing("ipmg"))
+        self.assertFalse(singleton.signal_existing(self.APP))
 
     def test_signal_then_wait(self):
         result = {}
 
         def waiter():
-            result["ok"] = singleton.wait_activate("ipmg", 3000)
+            result["ok"] = singleton.wait_activate(self.APP, 3000)
 
         thread = threading.Thread(target=waiter, name="test-wait-activate", daemon=True)
         thread.start()
@@ -174,7 +218,7 @@ class TestSingleton(unittest.TestCase):
         signaled = False
         deadline = time.time() + 2.0
         while time.time() < deadline:
-            if singleton.signal_existing("ipmg"):
+            if singleton.signal_existing(self.APP):
                 signaled = True
                 break
             time.sleep(0.05)
@@ -183,9 +227,71 @@ class TestSingleton(unittest.TestCase):
         self.assertTrue(result.get("ok"), "signal 后 wait_activate 应返回 True")
 
     def test_release_is_idempotent(self):
-        singleton.acquire("ipmg")
+        singleton.acquire(self.APP)
         singleton.release()
         singleton.release()  # 不应抛异常
+
+
+class TestRaiseConsole(unittest.TestCase):
+    """raise_console：重复启动时把既有窗口拉到前台（不需要 Win32Host 实例）。"""
+
+    def setUp(self):
+        # 保存整个 DLL 绑定对象（不能只存某个函数的引用，否则还原后模块会被污染）
+        self._real_k32 = win32host._kernel32
+        self._real_u32 = win32host._user32
+
+    def tearDown(self):
+        win32host._kernel32 = self._real_k32
+        win32host._user32 = self._real_u32
+
+    @unittest.skipUnless(_IS_WINDOWS, "仅 Windows")
+    def test_returns_false_without_console(self):
+        """无控制台窗口（ConPTY/无控制台）时必须安全返回 False。"""
+
+        class FakeK32:
+            @staticmethod
+            def GetConsoleWindow():
+                return 0
+
+        win32host._kernel32 = FakeK32
+        self.assertFalse(win32host.raise_console())
+
+    @unittest.skipUnless(_IS_WINDOWS, "仅 Windows")
+    def test_shows_and_focuses_window(self):
+        """有控制台窗口时应调用 ShowWindow + SetForegroundWindow。"""
+        used = []
+
+        class FakeK32:
+            @staticmethod
+            def GetConsoleWindow():
+                return 0x1234
+
+        class FakeU32:
+            @staticmethod
+            def ShowWindow(hwnd, cmd):
+                used.append(("show", hwnd, cmd))
+                return True
+
+            @staticmethod
+            def SetForegroundWindow(hwnd):
+                used.append(("focus", hwnd))
+                return True
+
+            @staticmethod
+            def IsWindowVisible(hwnd):
+                return True
+
+        win32host._kernel32, win32host._user32 = FakeK32, FakeU32
+        self.assertTrue(win32host.raise_console())
+        self.assertIn(("focus", 0x1234), used, "应尝试前置窗口")
+        self.assertTrue(any(u[0] == "show" for u in used), "应显示窗口")
+
+    @unittest.skipUnless(_IS_WINDOWS, "仅 Windows")
+    def test_restores_real_bindings(self):
+        """自检：用例结束后模块绑定必须恢复（防止污染后续用例）。"""
+        win32host._kernel32 = object()
+        win32host._kernel32 = self._real_k32
+        self.assertIs(win32host._kernel32, self._real_k32)
 
 
 # ============================== Win32Host 事件线程 ==============================

@@ -28,6 +28,7 @@ ERROR_ALREADY_EXISTS = 183
 EVENT_MODIFY_STATE = 0x0002
 SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0x00000000
+WAIT_ABANDONED = 0x00000080
 WAIT_TIMEOUT = 0x00000102
 
 
@@ -53,6 +54,8 @@ if _IS_WINDOWS:  # pragma: no cover - 平台分支
     _k32.SetEvent.restype = wintypes.BOOL
     _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     _k32.WaitForSingleObject.restype = wintypes.DWORD
+    _k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    _k32.ReleaseMutex.restype = wintypes.BOOL
     _k32.CloseHandle.argtypes = [wintypes.HANDLE]
     _k32.CloseHandle.restype = wintypes.BOOL
 else:  # pragma: no cover - 平台分支
@@ -89,6 +92,11 @@ def acquire(app_name: str = "ipmg") -> bool:
 
     返回 True = 本进程成为唯一实例；False = 已有实例在运行（或平台/API 不可用）。
     同一进程重复调用是幂等的。
+
+    判定用"创建 + 立即尝试取得所有权"（``WaitForSingleObject(0)``），而不是只看
+    ``CreateMutexW`` 的 ``ERROR_ALREADY_EXISTS``：后者只要系统里存在同名对象就
+    认为"已有实例在运行"，哪怕那个对象根本没人持有（别的进程创建过、释放过却
+    还留着句柄），会导致程序**永久拒绝启动**且难以自查。
     """
     global _mutex_handle, _mutex_name
 
@@ -100,14 +108,17 @@ def acquire(app_name: str = "ipmg") -> bool:
 
     name = mutex_name(app_name)
     try:
-        handle = _k32.CreateMutexW(None, True, name)
+        handle = _k32.CreateMutexW(None, False, name)   # 先不持有，稍后显式获取
         if not handle:
             _log.warning("acquire: CreateMutexW 失败 (err=%s)", _get_last_error())
             return False
-        if _get_last_error() == ERROR_ALREADY_EXISTS:
-            # 已有实例：立刻放弃本进程的句柄，不持有
+        rc = _k32.WaitForSingleObject(handle, 0)
+        if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            # WAIT_TIMEOUT = 另一个进程正持有 → 确实已有实例在运行
             _close(handle)
             return False
+        if rc == WAIT_ABANDONED:
+            _log.warning("acquire: 上一个实例异常退出（互斥体被放弃），本进程接管")
         _mutex_handle, _mutex_name = handle, name
         return True
     except Exception as exc:  # pragma: no cover - 防御
@@ -172,9 +183,14 @@ def wait_activate(app_name: str, timeout_ms: int) -> bool:
 
 
 def release(app_name: str = "ipmg") -> None:
-    """关闭本进程持有的互斥体/事件句柄（OS 亦会在进程退出时回收）。"""
+    """释放并关闭本进程持有的互斥体/事件句柄（OS 亦会在进程退出时回收）。"""
     global _mutex_handle, _mutex_name, _event_handle, _event_name
 
+    if _mutex_handle:
+        try:
+            _k32.ReleaseMutex(_mutex_handle)   # 先归还所有权，再关句柄
+        except Exception:  # pragma: no cover - 防御
+            pass
     _close(_mutex_handle)
     _close(_event_handle)
     _mutex_handle = None

@@ -8,6 +8,7 @@
 """
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -307,7 +308,8 @@ class TestParseArgs(unittest.TestCase):
     def test_defaults(self):
         flags = entry.parse_args([])
         self.assertEqual(flags, {"resident": False, "autostart_min": False,
-                                 "no_singleton": False, "selfcheck": False})
+                                 "no_singleton": False, "selfcheck": False,
+                                 "help": False, "version": False, "error": ""})
 
     def test_resident_and_min(self):
         flags = entry.parse_args(["--resident"])
@@ -321,9 +323,22 @@ class TestParseArgs(unittest.TestCase):
         self.assertTrue(flags["selfcheck"])
         self.assertTrue(flags["no_singleton"])
 
-    def test_unknown_flags_ignored(self):
-        flags = entry.parse_args(["--whatever", "-x"])
-        self.assertEqual(flags["resident"], False)
+    def test_help_and_version(self):
+        for arg in ("--help", "-h"):
+            self.assertTrue(entry.parse_args([arg])["help"], f"{arg} 应触发帮助")
+        for arg in ("--version", "-V"):
+            self.assertTrue(entry.parse_args([arg])["version"], f"{arg} 应显示版本")
+
+    def test_unknown_option_reports_error(self):
+        """未知选项要报错（以前是静默忽略，用户拼错了也不知道）。"""
+        flags = entry.parse_args(["--whatever"])
+        self.assertIn("--whatever", flags["error"])
+        self.assertFalse(flags["resident"])
+
+    def test_positional_args_ignored(self):
+        flags = entry.parse_args(["somefile.yaml"])
+        self.assertEqual(flags["error"], "")
+        self.assertFalse(flags["resident"])
 
 
 class TestApplyConfirm(ResidentTestCase):
@@ -412,6 +427,76 @@ class TestApplyConfirm(ResidentTestCase):
         c.start()
         self.assertTrue(c.skipped_hotkeys, "绑了热键却没启用，必须在启动信息里说明")
         self.assertIn("未启用", c.skipped_hotkeys[0][1])
+
+
+class TestSummonWatcher(unittest.TestCase):
+    """
+    重复启动时的"唤出既有窗口"链路。
+
+    历史问题：singleton.signal_existing() 一直被调用，但没有任何生产代码等待
+    ``Local\\ipmg.activate`` 事件，于是第二个实例提示"已请求显示"却没人响应。
+    """
+
+    def _run_watcher(self, controller):
+        from core import singleton, win32host
+        from ui import console as uconsole
+
+        calls = {"raise": 0, "wake": 0, "show": 0}
+        saved = [
+            (singleton, "wait_activate", singleton.wait_activate),
+            (win32host, "raise_console", win32host.raise_console),
+            (uconsole, "wake", uconsole.wake),
+            (entry._start_summon_watcher.__globals__.get("_start_summon_watcher"), None, None),
+        ]
+        saved = saved[:3]
+
+        class FakeController:
+            def show_console(self):
+                calls["show"] += 1
+                return True
+
+        signals = [True, False, False]
+
+        def fake_wait(name, timeout_ms):
+            # 第一次返回"收到信号"，之后一直超时（避免刷屏）
+            return signals.pop(0) if signals else False
+
+        import ui.resident as resident_module
+        saved.append((resident_module, "get_controller", resident_module.get_controller))
+
+        singleton.wait_activate = fake_wait
+        win32host.raise_console = lambda: calls.__setitem__("raise", calls["raise"] + 1) or True
+        uconsole.wake = lambda: calls.__setitem__("wake", calls["wake"] + 1)
+        resident_module.get_controller = lambda: controller
+
+        try:
+            entry._start_summon_watcher()
+            deadline = time.time() + 2
+            while time.time() < deadline and not calls["wake"]:
+                time.sleep(0.02)
+        finally:
+            for module, name, value in saved:
+                setattr(module, name, value)
+        return calls
+
+    def test_resident_instance_uses_controller_show_console(self):
+        class FakeController:
+            def __init__(self):
+                self.shown = 0
+
+            def show_console(self):
+                self.shown += 1
+                return True
+
+        controller = FakeController()
+        calls = self._run_watcher(controller)
+        self.assertEqual(controller.shown, 1, "常驻实例应通过控制器显示控制台")
+        self.assertGreaterEqual(calls["wake"], 1, "唤出后要唤醒主线程重绘")
+
+    def test_non_resident_instance_raises_console(self):
+        calls = self._run_watcher(None)
+        self.assertEqual(calls["raise"], 1, "非常驻实例应直接前置控制台窗口")
+        self.assertGreaterEqual(calls["wake"], 1, "唤出后要唤醒主线程重绘")
 
 
 class TestExitToTray(unittest.TestCase):
