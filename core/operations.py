@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from core import config_manager as cm
 from core.ip_configurator import set_static_ip, set_dhcp
-from core.network_utils import resolve_adapter_ip, resolve_management_url, ping_host
-from utils.backup import backup_adapter_config
+from core.network_utils import resolve_adapter_ip, resolve_management_url
+from utils.backup import backup_adapter_config, static_restore_args
 from utils.logger import log_operation
 
 
@@ -52,16 +52,21 @@ def save_state(config: dict, adapter_mac: str) -> None:
     cm.save_config(config)
 
 
-def verify_device(device_ip: str, timeout: int = 3) -> bool:
-    """Ping 设备验证连通性。"""
-    return ping_host(device_ip, timeout=timeout)
-
-
 def restore_to_dhcp(config: dict, adapter) -> Tuple[bool, str, dict]:
     """恢复网卡为 DHCP。失败抛出 RuntimeError（含用户提示）。"""
     set_dhcp(adapter.name)
     cm.save_config(config)
     return (True, "DHCP", config)
+
+
+def _same_ip_set(a, b) -> bool:
+    """
+    比较两份备份的全量 IP 字段（ips/masks/gateways）。
+    任一侧没有这些字段（旧格式条目）时视为一致，退回原有的单值比较，避免误判"找不到备份"。
+    """
+    if not a or not b:
+        return True
+    return a == b
 
 
 def _find_backup_pos(stack: list, target: dict) -> Optional[int]:
@@ -71,6 +76,9 @@ def _find_backup_pos(stack: list, target: dict) -> Optional[int]:
             bk.get("ip") == target.get("ip")
             and bk.get("mask") == target.get("mask")
             and bk.get("gateway") == target.get("gateway")
+            and _same_ip_set(bk.get("ips"), target.get("ips"))
+            and _same_ip_set(bk.get("masks"), target.get("masks"))
+            and _same_ip_set(bk.get("gateways"), target.get("gateways"))
             and bool(bk.get("is_dhcp")) == bool(target.get("is_dhcp"))
             and bk.get("timestamp") == target.get("timestamp")
         ):
@@ -95,12 +103,8 @@ def undo_to_backup(config: dict, adapter, target: dict) -> Tuple[bool, str, dict
             ok = set_dhcp(adapter.name)
             label = "DHCP"
         else:
-            ok = set_static_ip(
-                adapter.name,
-                target.get("ip", ""),
-                target.get("mask", "255.255.255.0"),
-                target.get("gateway", "") or None,
-            )
+            # 新格式备份带 ips/masks/gateways → 一次性还原主 IP + 次要 IP；旧条目自动退回单值
+            ok = set_static_ip(adapter.name, **static_restore_args(target))
             label = target.get("ip", "")
         if not ok:
             return (False, f"恢复到 {label} 失败", config)
@@ -117,11 +121,10 @@ def undo_to_backup(config: dict, adapter, target: dict) -> Tuple[bool, str, dict
 
 
 def history_restore(config: dict, adapter, record: dict) -> Tuple[bool, str, dict]:
-    """恢复历史记录中的静态 IP 配置。"""
-    ip = record.get("ip", "")
-    mask = record.get("mask", "255.255.255.0")
-    gateway = record.get("gateway", "") or None
-    ok = set_static_ip(adapter.name, ip, mask, gateway)
+    """恢复历史记录中的静态 IP 配置（多地址记录会一次性还原全部 IP）。"""
+    args = static_restore_args(record)
+    ip = args["ip"]
+    ok = set_static_ip(adapter.name, **args)
     if not ok:
         return (False, f"恢复静态IP失败: {ip}", config)
     cm.save_config(config)

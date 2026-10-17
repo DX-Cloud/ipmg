@@ -216,22 +216,27 @@ def set_setting(config: dict, key: str, value) -> dict:
 
 
 def _migrate_backup_format(config: dict) -> dict:
-    """将旧版单备份格式迁移为栈格式"""
+    """将旧版单备份格式迁移为栈格式（只增字段，不改既有字段语义）"""
     backups = config.get("backups", {})
     migrated = False
     for mac, backup in backups.items():
         if isinstance(backup, dict) and "ip" in backup:
             # 旧格式：单条备份 → 包装为列表
-            backups[mac] = [{
+            entry = {
                 "ip": backup.get("ip", ""),
                 "mask": backup.get("mask", ""),
                 "gateway": backup.get("gateway", ""),
                 "is_dhcp": backup.get("is_dhcp", True),
                 "adapter_name": backup.get("adapter_name", ""),
                 "timestamp": backup.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            }]
+            }
+            # 旧条目上的其它键（如新格式的 ips/masks/gateways、用户手写字段）原样保留，避免迁移丢数据
+            for key, value in backup.items():
+                entry.setdefault(key, value)
+            backups[mac] = [entry]
             migrated = True
         elif isinstance(backup, list):
+            # 已是栈格式（含带 ips/masks/gateways 的新条目）：原样保留，不做改写
             continue
         else:
             backups[mac] = []
@@ -488,17 +493,26 @@ def get_ip_history(config: dict, mac: str) -> list:
     return history
 
 
-def _make_history_key(ip: str, mask: str, gateway: str) -> str:
-    """生成历史记录去重用的唯一键"""
-    return f"{ip}|{mask}|{gateway}"
+def _make_history_key(ip: str, mask: str, gateway: str, ips: list = None) -> str:
+    """
+    生成历史记录去重用的唯一键。
+    带全量地址（ips）时把全部地址计入键，避免"主 IP 相同、次要 IP 不同"的配置被错误合并；
+    旧记录没有 ips 字段时按单值 ip 处理，新旧记录的键算法保持一致。
+    """
+    addr_key = ",".join(ips) if ips else (ip or "")
+    return f"{ip}|{mask}|{gateway}|{addr_key}"
 
 
-def add_ip_history(config: dict, mac: str, ip: str, mask: str, gateway: str, is_dhcp: bool = False) -> dict:
+def add_ip_history(config: dict, mac: str, ip: str, mask: str, gateway: str,
+                   is_dhcp: bool = False, ips: list = None, masks: list = None,
+                   gateways: list = None) -> dict:
     """
     添加IP历史记录。
     - 自动去重：相同IP配置合并为一项，更新时间戳
     - 限制最多保存MAX_HISTORY_RECORDS条记录
     - DHCP配置不记录到历史（因为有专门的DHCP选项）
+    - ips/masks/gateways（可选，向后兼容的新增参数）：该配置的全部 IPv4 地址/掩码/网关，
+      索引 0 为主 IP；不传时只记单值 ip/mask/gateway，行为与旧版完全一致。
     """
     if is_dhcp:
         # DHCP配置不记录到历史
@@ -515,14 +529,24 @@ def add_ip_history(config: dict, mac: str, ip: str, mask: str, gateway: str, is_
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+    # 新增字段（仅在有多地址信息时写入，旧数据结构保持不变）
+    full_ips = [a for a in (ips or []) if a]
+    if full_ips:
+        new_record["ips"] = full_ips
+        new_record["masks"] = list(masks or [])
+        full_gateways = [g for g in (gateways or []) if g]
+        if full_gateways:
+            new_record["gateways"] = full_gateways
+
     # 去重：检查是否已存在相同配置
-    new_key = _make_history_key(ip, mask, gateway or "")
+    new_key = _make_history_key(ip, mask, gateway or "", full_ips or None)
     existing_index = None
     for i, record in enumerate(history):
         existing_key = _make_history_key(
             record.get("ip", ""),
             record.get("mask", ""),
-            record.get("gateway", "")
+            record.get("gateway", ""),
+            record.get("ips") or None
         )
         if existing_key == new_key:
             existing_index = i
