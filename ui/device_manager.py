@@ -31,6 +31,7 @@ def show_device_manager(config: dict) -> dict:
         options = []
         index_map = {}
         non_selectable = set()
+        section_rows = set()
         opt_idx = 0
         raw_devices = config.get("devices", [])
 
@@ -39,6 +40,7 @@ def show_device_manager(config: dict) -> dict:
                 label = f"── [{g}] ──" if g else "── [未分组] ──"
                 options.append(label)
                 non_selectable.add(opt_idx)
+                section_rows.add(opt_idx)
                 opt_idx += 1
 
                 devices = by_group.get(g, [])
@@ -65,6 +67,7 @@ def show_device_manager(config: dict) -> dict:
             page_size=8, default_index=first_selectable,
             fixed_tail=["[+] 添加新设备"],
             non_selectable=non_selectable,
+            section_rows=section_rows,
         )
         if idx < 0:
             return config

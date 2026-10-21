@@ -112,11 +112,15 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
             fixed_tail: Sequence[str], allow_back: bool,
             hotkeys: Optional[Dict[str, int]], note_fn: Optional[Callable[[], str]],
             non_selectable: Set[int], cursor: Optional[tuple] = None,
-            default_index: Optional[int] = None) -> List[str]:
+            default_index: Optional[int] = None,
+            numbers: Optional[Dict[int, int]] = None,
+            cont_label: Optional[str] = None) -> List[str]:
     """
     构建一页菜单的文本行（含 rich 标记）。
     cursor 仅在键盘导航模式提供，为 (type, payload)：
       ("opt", 选项索引) / ("fixed", 固定尾部索引) / ("back", None)
+    numbers: 选项索引 → 展示序号（只含可选行；分组标题不占号）
+    cont_label: 续页时在本页顶部补的分组标题（标题在上一页）
     """
     lines: List[str] = [""]
     note = note_fn() if note_fn else ""
@@ -124,14 +128,19 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
     lines.append(f"[bold cyan]{title_line}[/bold cyan]")
     lines.append("-" * 55)
 
+    if cont_label:
+        lines.append(f"[dim]{cont_label}（续）[/dim]")
+
+    numbers = numbers if numbers is not None else {i: i + 1 for i in range(len(options))}
+    fixed_base = max(numbers.values()) if numbers else 0
+
     cursor_type, cursor_payload = (cursor or (None, None))
-    fixed_base = min(start + page_size, len(options))
     for i in range(start, end):
         opt = options[i]
-        num = i + 1
         if i in non_selectable:
             lines.append(f"   {opt}")
             continue
+        num = numbers.get(i, i + 1)
         if cursor_type == "opt" and cursor_payload == i:
             marker = " > "
         elif default_index is not None:
@@ -161,7 +170,8 @@ def _render(title: str, options: Sequence[str], start: int, end: int,
         marker = " > " if cursor_type == "back" else "   "
         lines.append(f"{marker}0. <-- 返回")
     if hotkeys:
-        keys = " ".join(f"{k}={hotkeys[k] + 1}" for k in sorted(hotkeys))
+        keys = " ".join(f"{k}={numbers.get(hotkeys[k], hotkeys[k] + 1)}"
+                        for k in sorted(hotkeys))
         lines.append(f"  [dim]快捷键: {keys}[/dim]")
     if cursor is not None:
         lines.append("  [dim]↑/↓ 或 j/k 移动, ←/→ 翻页, 回车确认, c 复制, f 过滤[/dim]")
@@ -261,6 +271,112 @@ def _last_selectable(entries: Sequence[tuple], non_selectable: Set[int]) -> int:
     return pos
 
 
+# ------------------------- 分组标题与分页（编号/续页） -------------------------
+
+def _is_section_row(text: str) -> bool:
+    """分组标题行的显示形态：``── [分组名] ──``。"""
+    stripped = (text or "").strip()
+    return stripped.startswith("──") and stripped.endswith("──")
+
+
+def _section_rows_of(options: Sequence[str], non_selectable: Set[int],
+                     section_rows: Optional[Set[int]] = None) -> Set[int]:
+    """
+    分组标题行索引集合。
+
+    调用方显式传入时以传入为准；未传时在"不可选行"里按标题形态识别，
+    这样旧调用点（只标记 non_selectable）也能得到正确的编号与续页行为。
+    """
+    if section_rows is not None:
+        return set(section_rows)
+    return {i for i in non_selectable if _is_section_row(options[i])}
+
+
+def _page_numbers(start: int, end: int, non_selectable: Set[int],
+                  fixed_tail: Sequence[str]) -> tuple:
+    """
+    计算**页内**编号：每页都从 1 开始，序号就是当前页的快捷键。
+
+    - 只有可选项参与编号，分组标题不占号；
+    - 固定尾部（如"添加新设备"）排在本页可选项之后，随页面重新编号；
+    - 返回 (numbers, by_number)：
+        numbers:   选项索引 → 页内序号（仅本页可选项）
+        by_number: 页内序号 → ("opt", 选项索引) 或 ("fixed", 固定尾部下标)
+    """
+    numbers: Dict[int, int] = {}
+    by_number: Dict[int, tuple] = {}
+    n = 0
+    for i in range(start, end):
+        if i in non_selectable:
+            continue
+        n += 1
+        numbers[i] = n
+        by_number[n] = ("opt", i)
+    for fi in range(len(fixed_tail)):
+        n += 1
+        by_number[n] = ("fixed", fi)
+    return numbers, by_number
+
+
+def _section_label_at(options: Sequence[str], section_rows: Set[int],
+                      idx: int) -> Optional[str]:
+    """idx 所属分组的标题文本（最近的上方标题行）；找不到返回 None。"""
+    for j in range(idx - 1, -1, -1):
+        if j in section_rows:
+            return options[j]
+    return None
+
+
+def _page_cont_label(options: Sequence[str], start: int, non_selectable: Set[int],
+                     section_rows: Set[int]) -> Optional[str]:
+    """
+    续页提示：本页首行属于某个分组、而该分组的标题在上一页时，返回标题文本。
+
+    否则用户翻到下一页只看到一串条目，不知道它们属于哪个分组。
+    """
+    if start <= 0 or start >= len(options) or start in non_selectable:
+        return None
+    return _section_label_at(options, section_rows, start)
+
+
+def _nearest_section_before(section_rows: Set[int], idx: int) -> Optional[int]:
+    """idx 之前最近的分组标题行索引（不含 idx 自身）。"""
+    for j in range(idx - 1, -1, -1):
+        if j in section_rows:
+            return j
+    return None
+
+
+def _paginate(total: int, non_selectable: Set[int], section_rows: Set[int],
+              page_size: int) -> List[tuple]:
+    """
+    计算分页区间 ``[(start_row, end_row), ...]``。
+
+    分页口径：**每页最多 page_size 个可选项**（即"设备行"配额），
+    分组标题是额外显示的行，不占这个配额；因此一页里可能先后出现两个分组。
+
+    标题归属（避免孤儿标题）：
+    - 某组首项排在当前页时，它的标题（若尚未在上一页显示）随本页一起显示；
+    - 若该组是接着上一页继续的，则本页顶部由 ``_page_cont_label`` 补一行标题。
+    """
+    selectables = [i for i in range(total) if i not in non_selectable]
+    pages: List[tuple] = []
+    if not selectables:
+        return [(0, total)]
+    for pos in range(0, len(selectables), max(1, page_size)):
+        chunk = selectables[pos:pos + max(1, page_size)]
+        if not chunk:
+            break
+        prev_end = pages[-1][1] if pages else 0
+        start = chunk[0]
+        header = _nearest_section_before(section_rows, chunk[0])
+        if header is not None and header >= prev_end:
+            start = header          # 标题还没出现过：随本页首项一起显示
+        end = chunk[-1] + 1
+        pages.append((start, end))
+    return pages
+
+
 def pick_option(options: List[str], title: str, default_index: int = 0,
                 allow_back: bool = True, page_size: int = 9,
                 fixed_tail: Optional[List[str]] = None,
@@ -271,11 +387,14 @@ def pick_option(options: List[str], title: str, default_index: int = 0,
                 filter_meta: Optional[Callable[[str], None]] = None,
                 note_fn: Optional[Callable[[], str]] = None,
                 copy_text: Optional[Callable[[int], str]] = None,
-                refresh_last: bool = False) -> int:
+                refresh_last: bool = False,
+                section_rows: Optional[Set[int]] = None) -> int:
     """
     统一数字选择菜单。
     - 返回 -1 表示返回；0..total-1 为选项索引；total+i 为固定尾部选项 i
     - non_selectable: 不可选中的选项索引集合（如分组标题）
+    - section_rows: 分组标题行索引集合（默认在 non_selectable 里按 ``── [x] ──`` 识别）。
+      标题不参与编号，且分页时不会被留在页尾；续页会在顶部补一行标题。
     - hotkeys: {字母: 选项索引} 快捷键映射
     - filterable: 允许输入非数字关键字过滤（需提供 filter_fn 重建选项列表）
     - copy_text: 输入 c<编号> 时调用，返回要复制的文本
@@ -294,14 +413,22 @@ def pick_option(options: List[str], title: str, default_index: int = 0,
         return _keyboard_pick(
             options, title, default_index, allow_back, page_size, fixed_tail,
             non_selectable, hotkeys, filterable, filter_fn, filter_meta,
-            note_fn, copy_text, refresh_last,
+            note_fn, copy_text, refresh_last, section_rows,
         )
 
     return _plain_pick(
         options, title, default_index, allow_back, page_size, fixed_tail,
         non_selectable, hotkeys, filterable, filter_fn, filter_meta,
-        note_fn, copy_text,
+        note_fn, copy_text, section_rows,
     )
+
+
+def _menu_layout(options: Sequence[str], non_selectable: Set[int],
+                 section_rows: Optional[Set[int]], page_size: int):
+    """统一的排版数据：分组标题集合与分页区间。返回 (pages, sections)。"""
+    sections = _section_rows_of(options, non_selectable, section_rows)
+    pages = _paginate(len(options), non_selectable, sections, page_size)
+    return pages, sections
 
 
 def _plain_pick(options: List[str], title: str, default_index: int,
@@ -309,19 +436,24 @@ def _plain_pick(options: List[str], title: str, default_index: int,
                 non_selectable: Set[int], hotkeys: Dict[str, int],
                 filterable: bool, filter_fn: Optional[Callable],
                 filter_meta: Optional[Callable],
-                note_fn: Optional[Callable], copy_text: Optional[Callable]) -> int:
-    total_pages = max(1, (len(options) + page_size - 1) // page_size)
+                note_fn: Optional[Callable], copy_text: Optional[Callable],
+                section_rows: Optional[Set[int]] = None) -> int:
+    pages, sections = _menu_layout(options, non_selectable, section_rows, page_size)
+    total_pages = len(pages)
     current_page = 0
 
     while True:
-        start = current_page * page_size
-        end = min(start + page_size, len(options))
-        fixed_base = min(start + page_size, len(options))
+        start, end = pages[current_page]
+        # 页内编号：每页重新从 1 开始（序号 = 当前页快捷键）
+        numbers, by_number = _page_numbers(start, end, non_selectable, fixed_tail)
+        max_valid = max(by_number) if by_number else 0
         _print_lines(_render(title, options, start, end, page_size, current_page,
                              total_pages, fixed_tail, allow_back, hotkeys, note_fn,
-                             non_selectable, default_index=default_index))
+                             non_selectable, default_index=default_index,
+                             numbers=numbers,
+                             cont_label=_page_cont_label(options, start,
+                                                         non_selectable, sections)))
 
-        max_valid = max(len(options), fixed_base + len(fixed_tail))
         prompt = f"请输入序号 (1-{max_valid}"
         if allow_back:
             prompt += ", 0=返回"
@@ -352,10 +484,11 @@ def _plain_pick(options: List[str], title: str, default_index: int,
                 current_page -= 1
             continue
 
-        # 复制：c<编号>
+        # 复制：c<编号>（编号是页内序号）
         if choice[:1].lower() == "c" and choice[1:].isdigit() and copy_text:
-            target = int(choice[1:]) - 1
-            text = copy_text(target)
+            kind, payload = by_number.get(int(choice[1:]), (None, None))
+            target = payload if kind == "opt" else -1
+            text = copy_text(target) if target is not None and target >= 0 else ""
             if copy_to_clipboard(text):
                 console.print(f"[green][OK] 已复制: {text}[/green]")
             else:
@@ -371,26 +504,28 @@ def _plain_pick(options: List[str], title: str, default_index: int,
             options[:] = filtered
             if filter_meta:
                 filter_meta(choice)
-            total_pages = max(1, (len(options) + page_size - 1) // page_size)
+            pages, sections = _menu_layout(options, non_selectable,
+                                           section_rows, page_size)
+            total_pages = len(pages)
             current_page = 0
             console.print(f"[green]匹配 {len(options)} 条（关键字: {choice}）[/green]")
             continue
 
         try:
-            idx = int(choice) - 1
-            if idx in non_selectable:
-                console.print("[red]该项不可选择[/red]")
-                continue
-            if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
-                return len(options) + (idx - fixed_base)
-            if 0 <= idx < len(options):
-                return idx
-            console.print(f"[red]无效输入，请输入 1-{max_valid}[/red]")
+            num = int(choice)
         except ValueError:
             if filterable:
                 console.print("[yellow]请输入数字序号、关键字或 c<编号>[/yellow]")
             else:
                 console.print("[red]请输入数字[/red]")
+            continue
+
+        kind, payload = by_number.get(num, (None, None))
+        if kind == "opt":
+            return payload
+        if kind == "fixed":
+            return len(options) + payload
+        console.print(f"[red]无效输入，请输入 1-{max_valid}[/red]")
 
 
 def _keyboard_available() -> bool:
@@ -431,10 +566,12 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                    non_selectable: Set[int], hotkeys: Dict[str, int],
                    filterable: bool, filter_fn: Optional[Callable],
                    filter_meta: Optional[Callable], note_fn: Optional[Callable],
-                   copy_text: Optional[Callable], refresh_last: bool = False) -> int:
+                   copy_text: Optional[Callable], refresh_last: bool = False,
+                   section_rows: Optional[Set[int]] = None) -> int:
     import msvcrt
 
-    total_pages = max(1, (len(options) + page_size - 1) // page_size)
+    pages, sections = _menu_layout(options, non_selectable, section_rows, page_size)
+    total_pages = len(pages)
     current_page = 0
     cursor_pos = 0
     number_buf = ""
@@ -442,8 +579,9 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
     dirty = True             # 仅在需要时才重绘：常驻态隐藏窗口时空闲不重画
 
     while True:
-        start = current_page * page_size
-        end = min(start + page_size, len(options))
+        start, end = pages[current_page]
+        # 页内编号：每页重新从 1 开始（序号 = 当前页快捷键）
+        numbers, by_number = _page_numbers(start, end, non_selectable, fixed_tail)
         # 当前页可导航条目：本页选项 + 固定尾部 + 返回
         entries = _page_entries(start, end, fixed_tail, allow_back)
 
@@ -464,7 +602,10 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
         if dirty:
             frame = _render(title, options, start, end, page_size, current_page,
                             total_pages, fixed_tail, allow_back, hotkeys, note_fn,
-                            non_selectable, cursor=entries[cursor_pos])
+                            non_selectable, cursor=entries[cursor_pos],
+                            numbers=numbers,
+                            cont_label=_page_cont_label(options, start,
+                                                        non_selectable, sections))
             if number_buf:
                 frame.append(f"[dim]已输入: {number_buf}（回车跳转）[/dim]")
             first_prev = []
@@ -495,10 +636,9 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
             elif current_page > 0:
                 # 已在页首继续上移：翻到上一页，光标落在上一页最后一个可选条目
                 current_page -= 1
-                prev_entries = _page_entries(
-                    current_page * page_size,
-                    min(current_page * page_size + page_size, len(options)),
-                    fixed_tail, allow_back)
+                prev_start, prev_end = pages[current_page]
+                prev_entries = _page_entries(prev_start, prev_end,
+                                             fixed_tail, allow_back)
                 cursor_pos = _last_selectable(prev_entries, non_selectable)
         elif key in ("down", "j", "J"):
             if cursor_pos < len(entries) - 1:
@@ -514,18 +654,13 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
         elif key == "enter":
             if number_buf and number_buf.isdigit():
                 entered = number_buf
-                idx = int(entered) - 1
+                num = int(entered)
                 number_buf = ""
-                if idx in non_selectable:
-                    msg = "[red]该项不可选择[/red]"
-                    _print_lines([msg])
-                    printed = printed + [msg]
-                    continue
-                fixed_base = min(start + page_size, len(options))
-                if idx >= fixed_base and idx < fixed_base + len(fixed_tail):
-                    return len(options) + (idx - fixed_base)
-                if 0 <= idx < len(options):
-                    return idx
+                kind, payload = by_number.get(num, (None, None))
+                if kind == "opt":
+                    return payload
+                if kind == "fixed":
+                    return len(options) + payload
                 msg = f"[red]无效序号 {entered}[/red]"
                 _print_lines([msg])
                 printed = printed + [msg]
@@ -588,7 +723,9 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
                     options[:] = filtered
                     if filter_meta:
                         filter_meta(keyword)
-                    total_pages = max(1, (len(options) + page_size - 1) // page_size)
+                    pages, sections = _menu_layout(options, non_selectable,
+                                                   section_rows, page_size)
+                    total_pages = len(pages)
                     current_page = 0
                     cursor_pos = 0
                     number_buf = ""

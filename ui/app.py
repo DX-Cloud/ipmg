@@ -50,8 +50,9 @@ def _last_backup_is_empty(config: dict, mac: str) -> bool:
 def _build_device_menu(config: dict, keyword: str = ""):
     """
     构建设备选择菜单（分组展示 + 关键字过滤）。
-    返回 (options, index_map, non_selectable, first_selectable)。
+    返回 (options, index_map, non_selectable, first_selectable, section_rows)。
     index_map: 选项索引 -> 设备 dict。
+    section_rows: 分组标题行索引（标题不参与编号，分页时也不会被留在页尾）。
     """
     devices = get_devices(config)
     if keyword:
@@ -71,11 +72,13 @@ def _build_device_menu(config: dict, keyword: str = ""):
     options = []
     index_map = {}
     non_selectable = set()
+    section_rows = set()
     opt = 0
     for g in groups:
         label = f"── [{g}] ──" if g else "── [未分组] ──"
         options.append(label)
         non_selectable.add(opt)
+        section_rows.add(opt)
         opt += 1
         for d in by_group[g]:
             fav = "*" if d.get("favorite") else " "
@@ -93,7 +96,7 @@ def _build_device_menu(config: dict, keyword: str = ""):
             opt += 1
 
     first = 1 if groups else 0
-    return options, index_map, non_selectable, first
+    return options, index_map, non_selectable, first, section_rows
 
 
 def _pick_device(config: dict, adapter) -> dict:
@@ -101,13 +104,21 @@ def _pick_device(config: dict, adapter) -> dict:
     选择设备：分组展示，支持关键字即时过滤与 c<编号> 复制。
     返回设备 dict，取消返回 None。
     """
-    state = {"keyword": ""}
+    # 注意：non_selectable / section_rows 必须是**同一个对象**在过滤后原地更新——
+    # widgets 持有的是进入菜单时传入的引用，重新赋值会让标记失效（编号与续页提示会错）
+    state = {"keyword": "",
+             "non_selectable": set(),
+             "section_rows": set()}
 
     def refilter(keyword: str):
         state["keyword"] = keyword
-        opts, imap, ns, first = _build_device_menu(config, keyword)
+        opts, imap, ns, first, sections = _build_device_menu(config, keyword)
         state["options"] = opts
-        state["index_map"], state["non_selectable"], state["first"] = imap, ns, first
+        state["index_map"], state["first"] = imap, first
+        state["non_selectable"].clear()
+        state["non_selectable"].update(ns)
+        state["section_rows"].clear()
+        state["section_rows"].update(sections)
         return opts
 
     def note():
@@ -128,6 +139,7 @@ def _pick_device(config: dict, adapter) -> dict:
             f"已选网卡: {adapter.name} | 选择设备",
             default_index=state["first"],
             non_selectable=state["non_selectable"],
+            section_rows=state["section_rows"],
             filterable=True,
             filter_fn=refilter,
             note_fn=note,
