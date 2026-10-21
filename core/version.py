@@ -4,9 +4,9 @@
 """
 
 # 程序当前版本（语义化版本号）
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 # 标题栏等界面展示用短版本号
-APP_VERSION_DISPLAY = "v1.4.1"
+APP_VERSION_DISPLAY = "v1.4.2"
 
 # GitHub 仓库（用于更新检测与 Release 跳转）
 GITHUB_REPO = "DX-Cloud/ipmg"
