@@ -271,6 +271,24 @@ def _last_selectable(entries: Sequence[tuple], non_selectable: Set[int]) -> int:
     return pos
 
 
+def _step_selectable(entries: Sequence[tuple], non_selectable: Set[int],
+                     pos: int, step: int) -> int:
+    """
+    沿 step 方向找下一个可选条目（跳过不可选的分组标题），**在页内循环**：
+    最后一项再往下回到第一项，第一项再往上回到最后一项（"返回"即 0 号）。
+
+    只在本页 entries 里移动，不会切页——翻页由 ←/→（或 n/p）负责。
+    """
+    total = len(entries)
+    if total == 0:
+        return pos
+    for k in range(1, total + 1):
+        cand = (pos + step * k) % total
+        if entries[cand][0] != "opt" or entries[cand][1] not in non_selectable:
+            return cand
+    return pos
+
+
 # ------------------------- 分组标题与分页（编号/续页） -------------------------
 
 def _is_section_row(text: str) -> bool:
@@ -627,30 +645,11 @@ def _keyboard_pick(options: List[str], title: str, default_index: int,
 
         dirty = True
         if key in ("up", "k", "K"):
-            if cursor_pos > 0:
-                new = cursor_pos - 1
-                while new > 0 and entries[new][0] == "opt" \
-                        and entries[new][1] in non_selectable:
-                    new -= 1
-                cursor_pos = new
-            elif current_page > 0:
-                # 已在页首继续上移：翻到上一页，光标落在上一页最后一个可选条目
-                current_page -= 1
-                prev_start, prev_end = pages[current_page]
-                prev_entries = _page_entries(prev_start, prev_end,
-                                             fixed_tail, allow_back)
-                cursor_pos = _last_selectable(prev_entries, non_selectable)
+            # 页内循环：第一项再往上 → 最后一项（"返回" 0 号）；不切页
+            cursor_pos = _step_selectable(entries, non_selectable, cursor_pos, -1)
         elif key in ("down", "j", "J"):
-            if cursor_pos < len(entries) - 1:
-                new = cursor_pos + 1
-                while new < len(entries) - 1 and entries[new][0] == "opt" \
-                        and entries[new][1] in non_selectable:
-                    new += 1
-                cursor_pos = new
-            elif current_page < total_pages - 1:
-                # 已在页尾继续下移：翻到下一页，光标落在下一页第一个可选条目
-                current_page += 1
-                cursor_pos = 0
+            # 页内循环：最后一项（"返回" 0 号）再往下 → 第一项；不切页
+            cursor_pos = _step_selectable(entries, non_selectable, cursor_pos, +1)
         elif key == "enter":
             if number_buf and number_buf.isdigit():
                 entered = number_buf

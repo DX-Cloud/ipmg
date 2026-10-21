@@ -306,6 +306,47 @@ class TestKeyboardPickPageLocal(unittest.TestCase):
                                    False, sections)
         self.assertIn("── [大组] ──", h.frame_text(), "续页顶部补分组标题")
 
+    def test_up_at_page_top_wraps_to_last_entry(self):
+        """↑ 到第一项后回绕到本页最后一项（"返回" 0 号），不切页。"""
+        options, ns, sections = build_options([("A", 7), ("B", 7), ("C", 8)])
+        h = KeyboardPickHarness(["up", "escape"])
+        with h:
+            widgets._keyboard_pick(options, "选择设备", 1, True, 9, [],
+                                   ns, {}, False, None, None, None, None,
+                                   False, sections)
+        self.assertIn("> 0. <-- 返回", h.frame_text(), "光标回绕到 0 号（返回）")
+        self.assertIn("(第1/", h.frame_text(), "不切页")
+
+    def test_down_at_last_entry_wraps_to_first(self):
+        """在 0 号继续 ↓ 回到第 1 项。"""
+        options, ns, sections = build_options([("A", 7), ("B", 7), ("C", 8)])
+        h = KeyboardPickHarness(["up", "down", "escape"])
+        with h:
+            widgets._keyboard_pick(options, "选择设备", 1, True, 9, [],
+                                   ns, {}, False, None, None, None, None,
+                                   False, sections)
+        self.assertIn("> 1. ", h.frame_text(), "从 0 号往下回到第 1 项")
+        self.assertIn("(第1/", h.frame_text(), "不切页")
+
+    def test_vertical_keys_never_switch_page(self):
+        """↑/↓ 无论如何都不切页（翻页只认 ←/→）。"""
+        options, ns, sections = build_options([("A", 7), ("B", 7), ("C", 8)])
+        h = KeyboardPickHarness(["right", "up", "up", "down", "up", "escape"])
+        with h:
+            widgets._keyboard_pick(options, "选择设备", 1, True, 9, [],
+                                   ns, {}, False, None, None, None, None,
+                                   False, sections)
+        self.assertIn("(第2/", h.frame_text(), "页内回绕始终停留第 2 页")
+
+    def test_only_left_right_switch_pages(self):
+        options, ns, sections = build_options([("A", 7), ("B", 7), ("C", 8)])
+        h = KeyboardPickHarness(["right", "right", "left", "escape"])
+        with h:
+            widgets._keyboard_pick(options, "选择设备", 1, True, 9, [],
+                                   ns, {}, False, None, None, None, None,
+                                   False, sections)
+        self.assertIn("(第2/", h.frame_text(), "→ 下一页、← 上一页")
+
 
 class TestDeviceMenuIntegration(unittest.TestCase):
     """ui/app.py 的菜单构建与标记同步。"""
